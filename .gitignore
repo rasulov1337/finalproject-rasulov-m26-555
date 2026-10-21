@@ -1,0 +1,17 @@
+# Байткод и кеш Python
+__pycache__/
+*.py[cod]
+
+# Сборка и дистрибутивы
+dist/
+build/
+*.egg-info/
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Служебные файлы ОС и редакторов
+.DS_Store
+.idea/
+.vscode/
