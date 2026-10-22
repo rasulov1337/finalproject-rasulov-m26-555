@@ -15,8 +15,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from ..infra.database import DatabaseManager
 from .currencies import Currency, get_currency
@@ -87,7 +88,7 @@ class User:
         username: str,
         password: str,
         registration_date: datetime | str | None = None,
-    ) -> "User":
+    ) -> User:
         """Создать нового пользователя: сгенерировать соль и захешировать пароль."""
         username = validate_username(username)
         password = validate_password(password)
@@ -101,7 +102,7 @@ class User:
         )
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "User":
+    def from_dict(cls, data: Mapping[str, Any]) -> User:
         """Восстановить пользователя из словаря (users.json)."""
         return cls(
             user_id=data["user_id"],
@@ -232,7 +233,7 @@ class Wallet:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any], currency_code: str | None = None) -> "Wallet":
+    def from_dict(cls, data: Mapping[str, Any], currency_code: str | None = None) -> Wallet:
         """Восстановить кошелёк из словаря (код валюты может быть ключом)."""
         code = data.get("currency_code") or currency_code
         return cls(code, data.get("balance", 0.0))
@@ -298,7 +299,7 @@ class Portfolio:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "Portfolio":
+    def from_dict(cls, data: Mapping[str, Any]) -> Portfolio:
         """Восстановить портфель из словаря (portfolios.json)."""
         return cls(data["user_id"], data.get("wallets") or {})
 

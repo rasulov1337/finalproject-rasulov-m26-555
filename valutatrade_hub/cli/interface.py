@@ -127,10 +127,24 @@ COMMANDS: dict[str, Command] = {
             "amount": FlagSpec("--amount", required=True),
         },
     ),
-    "refresh-rates": Command(
-        usage="refresh-rates",
-        description="Принудительно обновить курсы через Parser Service",
-        handler="refresh_rates",
+    "update-rates": Command(
+        usage="update-rates [--source coingecko|exchangerate] [--interval <сек>]",
+        description="Обновить курсы через Parser Service (--interval — по расписанию)",
+        handler="update_rates",
+        flags={
+            "source": FlagSpec("--source"),
+            "interval": FlagSpec("--interval"),
+        },
+    ),
+    "show-rates": Command(
+        usage="show-rates [--currency <код>] [--top <N>] [--base <код>]",
+        description="Показать таблицу курсов из локального кеша",
+        handler="show_rates",
+        flags={
+            "currency": FlagSpec("--currency"),
+            "top": FlagSpec("--top"),
+            "base_currency": FlagSpec("--base"),
+        },
     ),
 }
 

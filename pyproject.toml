@@ -4,7 +4,15 @@ version = "0.1.0"
 description = "Платформа для отслеживания и симуляции торговли валютами"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "requests>=2.32",     # HTTP-клиент Parser Service (CoinGecko, ExchangeRate-API)
+    "prettytable>=3.10",  # форматированные таблицы (show-rates)
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",          # линтер и форматер
+]
 
 [project.scripts]
 valutatrade-hub = "valutatrade_hub.cli.interface:main"
@@ -15,6 +23,37 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["valutatrade_hub"]
+
+# ---------------------------------------------------------------------------
+# Ruff: линтер и форматер (uv run ruff check . && uv run ruff format --check .)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle: ошибки
+    "W",   # pycodestyle: предупреждения
+    "F",   # pyflakes (в т.ч. F821 — неопределённые имена)
+    "I",   # isort: сортировка импортов
+    "UP",  # pyupgrade: современный синтаксис
+    "B",   # flake8-bugbear: вероятные баги
+    "C4",  # flake8-comprehensions
+    "ISC", # flake8-implicit-str-concat
+    "PYI", # flake8-pyi: аннотации типов
+    "RUF", # ruff-specific правила
+]
+ignore = [
+    # Русскоязычный проект: ё/«»/— и стрелки → в строках, докстрингах и
+    # комментариях регулярно дают ложные срабатывания «ambiguous character».
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["valutatrade_hub"]
 
 # ---------------------------------------------------------------------------
 # Конфигурация приложения (читается синглтоном SettingsLoader).

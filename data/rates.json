@@ -1,1 +1,60 @@
-{}
+{
+  "pairs": {
+    "BTC_USD": {
+      "rate": 59337.21,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "CNY_USD": {
+      "rate": 0.1386,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "ETH_USD": {
+      "rate": 3720.0,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "EUR_USD": {
+      "rate": 1.0786,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "GBP_USD": {
+      "rate": 1.27,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "JPY_USD": {
+      "rate": 0.0067,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "KZT_USD": {
+      "rate": 0.00205,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "RUB_USD": {
+      "rate": 0.01016,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "SOL_USD": {
+      "rate": 145.12,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "TON_USD": {
+      "rate": 5.25,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    },
+    "USDT_USD": {
+      "rate": 1.0,
+      "updated_at": "2026-10-22T12:58:49Z",
+      "source": "seed"
+    }
+  },
+  "last_refresh": "2026-10-22T12:58:49Z"
+}

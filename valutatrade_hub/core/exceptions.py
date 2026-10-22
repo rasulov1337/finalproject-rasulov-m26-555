@@ -62,8 +62,7 @@ class InsufficientFundsError(ValutaTradeError):
 
     def __init__(self, available: str, required: str, code: str) -> None:
         super().__init__(
-            f"Недостаточно средств: доступно {available} {code}, "
-            f"требуется {required} {code}"
+            f"Недостаточно средств: доступно {available} {code}, требуется {required} {code}"
         )
         self.available = available
         self.required = required
@@ -92,9 +91,18 @@ class ApiRequestError(ValutaTradeError):
     """Сбой при обращении к внешнему API (Parser Service).
 
     Формат сообщения: ``Ошибка при обращении к внешнему API: {reason}``.
-    Выбрасывается в слое получения курсов (``RateService``/заглушка).
+    Выбрасывается в слое получения курсов (``parser_service/api_clients.py``).
     """
 
     def __init__(self, reason: str) -> None:
         super().__init__(f"Ошибка при обращении к внешнему API: {reason}")
         self.reason = reason
+
+
+class RatesNotAvailableError(ValutaTradeError):
+    """Курсы недоступны: локальный кеш пуст или пара не найдена в кеше.
+
+    Сообщение формируется в месте поднятия, например:
+    «Локальный кеш курсов пуст. Выполните 'update-rates', чтобы загрузить данные.»
+    или «Курс для 'ABC' не найден в кеше.»
+    """

@@ -6,14 +6,15 @@
 
 Система состоит из двух сервисов:
 
-- **Сервис Парсинга (Parser Service)** — отдельное приложение, которое по
-  запросу или расписанию обращается к публичным API, получает актуальные
-  курсы, сравнивает их с предыдущими значениями и сохраняет историю в базу
-  данных. Пока он не подключён, используется заглушка `StubParserClient`
-  с фиксированными курсами и локальный кеш `data/rates.json`.
 - **Основной Сервис (Core Service)** — это приложение: CLI, пользователи,
-  кошельки, история транзакций и взаимодействие с сервисом парсинга для
-  получения актуальных курсов.
+  кошельки, сделки. За курсы не ходит в сеть — читает локальный кеш
+  `data/rates.json`.
+- **Сервис Парсинга (Parser Service)** — пакет `valutatrade_hub/parser_service/`:
+  обращается к внешним API ([CoinGecko](https://www.coingecko.com/) —
+  криптовалюты, [ExchangeRate-API](https://www.exchangerate-api.com/) — фиат),
+  обновляет кеш `data/rates.json` и ведёт журнал измерений
+  `data/exchange_rates.json`. Запускается командой `update-rates` — разово
+  или по расписанию (`--interval`).
 
 ## Структура проекта
 
@@ -23,9 +24,13 @@ finalproject-rasulov-m26-555/
 ├── data/
 │    ├── users.json             # список пользователей
 │    ├── portfolios.json        # портфели и кошельки
-│    └── rates.json             # кеш курсов валют
+│    ├── rates.json             # кеш курсов (последний срез)
+│    └── exchange_rates.json    # журнал измерений (история курсов)
 ├── logs/
-│    └── actions.log            # журнал операций (ротация 1 МБ × 3)
+│    ├── actions.log            # журнал операций (ротация 1 МБ × 3)
+│    └── parser.log             # журнал Parser Service
+├── demo/
+│    └── demo.cast              # запись демо (asciinema play demo/demo.cast)
 ├── valutatrade_hub/
 │    ├── __init__.py
 │    ├── logging_config.py      # настройка логов (формат, уровень, ротация)
@@ -36,18 +41,25 @@ finalproject-rasulov-m26-555/
 │    │    ├── exceptions.py     # пользовательские исключения
 │    │    ├── models.py         # классы User, Wallet, Portfolio
 │    │    ├── usecases.py       # бизнес-логика: AppService, RateService
-│    │    └── utils.py          # валидация, хеширование, конвертации, форматирование
+│    │    └── utils.py          # валидация, конвертации, форматирование
 │    ├── infra/
 │    │    ├── __init__.py
 │    │    ├── settings.py       # Singleton SettingsLoader (конфигурация)
 │    │    └── database.py       # Singleton DatabaseManager (JSON-хранилище)
+│    ├── parser_service/        # Сервис Парсинга (раздел 4)
+│    │    ├── __init__.py
+│    │    ├── config.py         # ParserConfig: ключи, эндпоинты, списки валют
+│    │    ├── api_clients.py    # CoinGeckoClient, ExchangeRateApiClient (ABC)
+│    │    ├── storage.py        # журнал exchange_rates.json + срез rates.json
+│    │    ├── updater.py        # RatesUpdater: опрос клиентов → сохранение
+│    │    └── scheduler.py      # периодическое обновление (run_forever)
 │    └── cli/
 │         ├── __init__.py
 │         └── interface.py      # команды CLI
 │
 ├── main.py                     # точка входа
 ├── uv.lock
-├── pyproject.toml              # метаданные + секция [tool.valutatrade]
+├── pyproject.toml              # метаданные + секции [tool.valutatrade]/[tool.ruff]
 ├── README.md
 └── .gitignore
 ```
@@ -55,8 +67,8 @@ finalproject-rasulov-m26-555/
 ## Требования
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (или любой Python 3.11+ без uv — проект
-  не использует внешних зависимостей)
+- [uv](https://docs.astral.sh/uv/) — зависимости ставятся командой `uv sync`
+  (`requests` — HTTP-клиент парсера, `prettytable` — таблицы `show-rates`)
 
 ## Запуск
 
@@ -66,16 +78,11 @@ uv run main.py                # интерактивный режим (REPL)
 uv run valutatrade-hub        # то же самое через консольную точку входа
 ```
 
-Без uv:
-
-```bash
-python3 main.py
-```
-
 Одна команда без входа в REPL:
 
 ```bash
 uv run main.py get-rate --from USD --to BTC
+uv run main.py update-rates --source coingecko
 ```
 
 ## Команды
@@ -94,14 +101,106 @@ uv run main.py get-rate --from USD --to BTC
 | `currencies` | Список поддерживаемых валют (фиат и крипто) |
 | `add-currency --currency <код>` | Добавить пустой кошелёк |
 | `deposit --currency <код> --amount <кол-во>` | Пополнить кошелёк (демо-режим) |
-| `refresh-rates` | Принудительно обновить курсы через Parser Service |
+| `update-rates [--source coingecko\|exchangerate] [--interval <сек>]` | Обновить курсы через Parser Service (`--interval` — по расписанию, выход по Ctrl+C) |
+| `show-rates [--currency <код>] [--top <N>] [--base <код>]` | Таблица курсов из локального кеша |
 | `help` / `exit` | Справка / выход |
+
+## Сервис Парсинга (раздел 4)
+
+### Источники курсов
+
+| Клиент | Источник | Что даёт | Ключ |
+| --- | --- | --- | --- |
+| `CoinGeckoClient` | `api.coingecko.com/api/v3/simple/price` | курсы криптовалют (BTC, ETH, USDT, TON, SOL) к USD | не нужен (публичный API) |
+| `ExchangeRateApiClient` | `v6.exchangerate-api.com` | курсы фиатных валют (EUR, GBP, RUB, JPY, CNY, KZT) к USD | **нужен** |
+
+API-ключ ExchangeRate-API **хранится только в переменной окружения**
+`EXCHANGERATE_API_KEY` — в коде и git его нет:
+
+```bash
+export EXCHANGERATE_API_KEY="ваш-ключ"   # получить: https://www.exchangerate-api.com/
+uv run main.py update-rates
+```
+
+Без ключа крипто-курсы всё равно обновятся через CoinGecko, а по фиату будет
+честная ошибка:
+
+```text
+INFO: Starting rates update...
+INFO: Fetching from CoinGecko... OK (5 rates)
+ERROR: Failed to fetch from ExchangeRate-API: API key not set (EXCHANGERATE_API_KEY)
+INFO: Writing 5 rates to data/rates.json...
+Update completed with errors. Check logs/parser.log for details.
+```
+
+Оба клиента наследуют абстрактный `BaseApiClient` (интерфейс
+`fetch_rates() -> dict[пара → RateEntry]`), поэтому новый источник — это ещё
+один подкласс. Все сетевые сбои (таймаут, HTTP 429/403, битый JSON, отсутствие
+ключа) нормализуются в `ApiRequestError` с понятной причиной (reason).
+
+### Команда `update-rates`
+
+1. опрашивает клиентов (всех или один по `--source`);
+2. курсы от отказавшего источника не теряются — сохраняется то, что удалось
+   получить (отказоустойчивость);
+3. пишет журнал `data/exchange_rates.json` — **каждое измерение** с
+   уникальным `id` вида `<FROM>_<TO>_<UTC-timestamp>`; повторный замер с тем
+   же временем не дублируется (дедупликация по `id`);
+4. обновляет срез `data/rates.json` по правилу «апдейт побеждает, если
+   `updated_at` свежее текущего» — частичное обновление (`--source`) не
+   затирает курсы из другого источника.
+
+`update-rates --interval 300` — планировщик: обновлять каждые N секунд,
+выход по Ctrl+C. Все шаги пишутся в `logs/parser.log`.
+
+### Команда `show-rates`
+
+Таблица курсов из кеша (prettytable) с временем обновления каждой пары:
+
+```text
+> show-rates --top 3
+Rates from cache (updated at 2026-10-22T16:03:00):
++---------+----------+---------------------+
+| Pair    |   Rate   |       Updated       |
++---------+----------+---------------------+
+| BTC_USD | 59337.21 | 2026-10-22 16:03:00 |
+| ETH_USD |   3720   | 2026-10-22 16:03:00 |
+| SOL_USD |  145.12  | 2026-10-22 16:03:00 |
++---------+----------+---------------------+
+```
+
+Фильтры (в порядке приоритета): `--currency <код>` — одна пара;
+`--top <N>` — N самых дорогых криптовалют; `--base <код>` — кросс-курсы всех
+валют к указанной (например, `--base EUR`); без флагов — все пары к USD.
+
+## Как работают курсы
+
+Курсы хранятся как «1 единица валюты → USD» (например, `BTC_USD: 59337.21`).
+Курс произвольной пары A→B считается кросс-курсом через USD:
+`rates[A] / rates[B]` (утилита `cross_rate`).
+
+`get-rate` и сделки работают так:
+
+1. читаем локальный кеш `data/rates.json`;
+2. кеш пуст → `RatesNotAvailableError`: «Локальный кеш курсов пуст.
+   Выполните 'update-rates', чтобы загрузить данные.»;
+3. кеш старше `rates_ttl_seconds` (по умолчанию 300 c) → курсы
+   используются, но к выводу добавляется предупреждение:
+   «Внимание: кеш курсов устарел — выполните update-rates.»;
+4. кода нет в кеше (например, источник недоступен) → «Курс для 'XYZ' не
+   найден в кеше.»
+
+Обновляет кеш **только** команда `update-rates` (Parser Service): Core
+Service в сеть не ходит, поэтому приложение продолжает работать даже без
+интернета — просто предупреждает об устаревании данных.
 
 ## Иерархия валют (раздел 3.1)
 
 Валюты — закрытый реестр: сделки, курсы и кошельки работают только с
 валютами из `core/currencies.py`. Новая валюта добавляется одной записью в
-`_REGISTRY_DATA` (и, при необходимости, курсом в `utils.STUB_USD_RATES`).
+`_REGISTRY_DATA` (и тикером в `CRYPTO_ID_MAP` парсера, если это крипта).
+Пример: `SOL` (Solana, Proof-of-History, капитализация 6.0e10) добавлена в
+разделе 4.
 
 - абстрактный базовый класс `Currency`: публичные атрибуты `name`, `code`;
   инварианты — код в верхнем регистре, 2–5 символов, без пробелов; имя —
@@ -111,16 +210,6 @@ uv run main.py get-rate --from USD --to BTC
 - фабрика `get_currency(code)` возвращает объект валюты (регистр не важен),
   для неизвестного кода бросает `CurrencyNotFoundError`;
 - `Wallet.currency` — свойство-интеграция: полиморфный объект валюты кошелька.
-
-```text
-> currencies
-Поддерживаемые валюты:
-  [FIAT] CNY — Chinese Yuan (Issuing: China)
-  ...
-  [FIAT] USD — US Dollar (Issuing: United States)
-  [CRYPTO] BTC — Bitcoin (Algo: SHA-256, MCAP: 1.12e12)
-  ...
-```
 
 ## Пользовательские исключения (раздел 3.2)
 
@@ -132,7 +221,8 @@ uv run main.py get-rate --from USD --to BTC
 | --- | --- | --- |
 | `InsufficientFundsError` | `Недостаточно средств: доступно {available} {code}, требуется {required} {code}` | `Wallet.withdraw()`, `sell` |
 | `CurrencyNotFoundError` | `Неизвестная валюта '{code}'` (+ список кодов) | `get_currency()`, `buy`/`sell`/`get-rate` |
-| `ApiRequestError` | `Ошибка при обращении к внешнему API: {reason}` (+ «повторите позже») | слой получения курсов |
+| `ApiRequestError` | `Ошибка при обращении к внешнему API: {reason}` | клиенты Parser Service |
+| `RatesNotAvailableError` | `Локальный кеш курсов пуст. Выполните 'update-rates'...` / `Курс для 'XYZ' не найден в кеше.` | `RateService` (чтение кеша) |
 
 ## Конфигурация и синглтоны (раздел 3.3)
 
@@ -176,36 +266,8 @@ INFO 2026-10-09T12:06:10 SELL user='alice' currency='BTC' amount=99.0000 base='U
 `RotatingFileHandler` (1 МБ, 3 бэкапа), уровень из настроек, в stdout лог
 не пишется.
 
-## Как работают курсы
-
-Курсы хранятся как «1 единица валюты → USD» (например, `BTC_USD: 59337.21`).
-Курс произвольной пары A→B считается кросс-курсом через USD:
-`rates[A] / rates[B]` (утилита `cross_rate`).
-
-Порядок получения курса (`get-rate` и сделки):
-
-1. берём курс из локального кеша `data/rates.json`;
-2. если кеш свежий (моложе `rates_ttl_seconds`) — используем его;
-3. иначе запрашиваем у Parser Service (заглушка), обновляем кеш и показываем курс;
-4. при сбое сервиса — `ApiRequestError`, но если есть хотя бы устаревший
-   кеш, используется он.
-
-### Единый контракт Parser Service
-
-Чтобы подключить реальный сервис парсинга, достаточно реализовать протокол
-`ParserClient` из `valutatrade_hub/core/usecases.py` и передать его в
-`RateService`:
-
-```python
-class ParserClient(Protocol):
-    source: str
-    def fetch_rates(self) -> dict[str, float]:
-        """Вернуть словарь «код валюты → сколько USD стоит 1 единица»."""
-```
-
-Заглушка `StubParserClient` возвращает фиксированные курсы из
-`utils.STUB_USD_RATES`. HTTP-реализация будет отличаться только внутренностями
-`fetch_rates()` (запрос к API Parser Service вместо чтения константы).
+Parser Service пишет собственный журнал `logs/parser.log` (тот же формат и
+ротация): старты обновлений, ответы источников, итоги цикла.
 
 ## Логика сделок
 
@@ -252,13 +314,49 @@ class ParserClient(Protocol):
 ]
 ```
 
-`data/rates.json` (кеш курсов):
+`data/rates.json` — кеш курсов (последний срез, пишет Parser Service):
 
 ```json
 {
-  "EUR_USD": {"rate": 1.0786, "updated_at": "2025-10-09T10:30:00"},
-  "BTC_USD": {"rate": 59337.21, "updated_at": "2025-10-09T10:29:42"},
-  "source": "ParserService",
-  "last_refresh": "2025-10-09T10:35:00"
+  "pairs": {
+    "BTC_USD": {"rate": 81632.0, "updated_at": "2026-10-22T13:03:01Z", "source": "CoinGecko"},
+    "EUR_USD": {"rate": 1.0786, "updated_at": "2026-10-22T13:03:00Z", "source": "ExchangeRate-API"}
+  },
+  "last_refresh": "2026-10-22T13:03:01Z"
 }
+```
+
+`data/exchange_rates.json` — журнал измерений (история):
+
+```json
+[
+  {
+    "id": "BTC_USD_2026-10-22T13:03:01Z",
+    "from_currency": "BTC",
+    "to_currency": "USD",
+    "rate": 81632.0,
+    "timestamp": "2026-10-22T13:03:01Z",
+    "source": "CoinGecko",
+    "meta": {"raw_id": "bitcoin", "request_ms": 412, "status_code": 200, "etag": "\"abc\""}
+  }
+]
+```
+
+## Качество кода
+
+Линтер и форматер — [ruff](https://docs.astral.sh/ruff/) (конфигурация в
+`pyproject.toml`, включая правила для русскоязычных строк):
+
+```bash
+uv run ruff check .            # 0 ошибок
+uv run ruff format --check .   # форматирование
+```
+
+## Демо
+
+Запись полного цикла работы (регистрация → вход → пополнение → сделки →
+портфель → курсы → обновление через Parser Service → обработка ошибок):
+
+```bash
+asciinema play demo/demo.cast
 ```

@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 #: Встроенные значения по умолчанию (используются, если ключа нет в конфиге).
 _DEFAULTS: dict[str, Any] = {
@@ -44,9 +44,9 @@ class SettingsLoader:
     - ``log_max_bytes`` / ``log_backup_count`` — параметры ротации логов.
     """
 
-    _instance: "SettingsLoader | None" = None
+    _instance: SettingsLoader | None = None
 
-    def __new__(cls) -> "SettingsLoader":
+    def __new__(cls) -> Self:
         if cls._instance is None:
             instance = super().__new__(cls)
             instance._load()

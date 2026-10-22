@@ -12,9 +12,10 @@ import hmac
 import math
 import re
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Mapping
+from datetime import UTC, datetime
+from typing import Any
 
 from .exceptions import CurrencyNotFoundError, ValidationError
 
@@ -28,8 +29,9 @@ CURRENCY_CODE_RE = re.compile(r"^[A-Z0-9]{2,5}$")
 #: Валюты, суммы в которых показываем с 4 знаками после запятой.
 CRYPTO_CURRENCIES = {"BTC", "ETH", "USDT", "TON", "SOL", "XRP", "DOGE", "BNB"}
 
-#: Заглушка курсов Parser Service: сколько USD стоит 1 единица валюты.
-#: Ключи должны покрывать весь реестр ``currencies._REGISTRY_DATA``.
+#: Заглушка курсов (фиксированные значения по умолчанию): сколько USD стоит
+#: 1 единица валюты. Ключи покрывают весь реестр ``currencies._REGISTRY_DATA``;
+#: реальные курсы пишет Parser Service в ``data/rates.json``.
 STUB_USD_RATES: dict[str, float] = {
     "USD": 1.0,
     "EUR": 1.0786,
@@ -42,6 +44,7 @@ STUB_USD_RATES: dict[str, float] = {
     "ETH": 3720.0,
     "USDT": 1.0,
     "TON": 5.25,
+    "SOL": 145.12,
 }
 
 
@@ -51,8 +54,13 @@ STUB_USD_RATES: dict[str, float] = {
 
 
 def now() -> datetime:
-    """Текущее локальное время."""
+    """Текущее локальное время (naive)."""
     return datetime.now()
+
+
+def now_utc() -> datetime:
+    """Текущее время UTC (aware) — для таймстампов Parser Service."""
+    return datetime.now(UTC)
 
 
 def to_iso(dt: datetime) -> str:
@@ -60,16 +68,35 @@ def to_iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat()
 
 
+def to_iso_utc(dt: datetime) -> str:
+    """Datetime → строка ISO 8601 UTC с суффиксом Z (для журнала и id записей)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def to_naive_local(dt: datetime) -> datetime:
+    """Привести aware-время к naive локальному (для сравнения с ``now()``)."""
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 def parse_dt(value: datetime | str | None) -> datetime | None:
-    """Строка ISO 8601 → datetime; при ошибке возвращает None."""
+    """Строка ISO 8601 → datetime; aware-значения приводятся к локальному naive.
+
+    Возвращает None, если значение не распознаётся.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    return to_naive_local(dt)
 
 
 def format_dt(dt: datetime) -> str:
@@ -126,7 +153,8 @@ def validate_currency_code(value: str) -> str:
     code = value.strip().upper()
     if not CURRENCY_CODE_RE.match(code):
         raise ValidationError(
-            f"Некорректный код валюты: '{value}' (ожидается 2–5 заглавных символов, например USD или BTC)"
+            f"Некорректный код валюты: '{value}' "
+            "(ожидается 2–5 заглавных символов, например USD или BTC)"
         )
     return code
 
@@ -150,6 +178,18 @@ def validate_amount(value: Any, name: str = "amount") -> float:
     if not math.isfinite(amount) or amount <= 0:
         raise ValidationError(message)
     return amount
+
+
+def validate_positive_int(value: Any, name: str = "value") -> int:
+    """Целое число больше нуля (строки тоже принимаются)."""
+    message = f"'{name}' должен быть положительным целым числом"
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(message) from None
+    if number <= 0:
+        raise ValidationError(message)
+    return number
 
 
 # ---------------------------------------------------------------------------

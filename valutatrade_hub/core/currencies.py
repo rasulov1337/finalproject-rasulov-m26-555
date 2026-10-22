@@ -79,7 +79,18 @@ _REGISTRY_DATA: dict[str, dict[str, Any]] = {
     "BTC": {"kind": "crypto", "name": "Bitcoin", "algorithm": "SHA-256", "market_cap": 1.12e12},
     "ETH": {"kind": "crypto", "name": "Ethereum", "algorithm": "Ethash", "market_cap": 3.8e11},
     "USDT": {"kind": "crypto", "name": "Tether", "algorithm": "ERC-20", "market_cap": 1.1e11},
-    "TON": {"kind": "crypto", "name": "Toncoin", "algorithm": "Proof-of-Stake", "market_cap": 1.5e10},
+    "TON": {
+        "kind": "crypto",
+        "name": "Toncoin",
+        "algorithm": "Proof-of-Stake",
+        "market_cap": 1.5e10,
+    },
+    "SOL": {
+        "kind": "crypto",
+        "name": "Solana",
+        "algorithm": "Proof-of-History",
+        "market_cap": 6.0e10,
+    },
 }
 
 
@@ -89,7 +100,9 @@ def _build_registry() -> dict[str, Currency]:
         if data["kind"] == "fiat":
             registry[code] = FiatCurrency(code, data["name"], data["issuing_country"])
         else:
-            registry[code] = CryptoCurrency(code, data["name"], data["algorithm"], data["market_cap"])
+            registry[code] = CryptoCurrency(
+                code, data["name"], data["algorithm"], data["market_cap"]
+            )
     return registry
 
 

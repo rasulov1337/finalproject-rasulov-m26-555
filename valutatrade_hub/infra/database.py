@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from ..core.exceptions import ValidationError
 from .settings import SettingsLoader
@@ -27,9 +27,9 @@ class DatabaseManager:
     в объекты ``User``/``Portfolio`` выполняется слоем бизнес-логики.
     """
 
-    _instance: "DatabaseManager | None" = None
+    _instance: DatabaseManager | None = None
 
-    def __new__(cls) -> "DatabaseManager":
+    def __new__(cls) -> Self:
         if cls._instance is None:
             instance = super().__new__(cls)
             data_dir = SettingsLoader().data_dir
@@ -89,9 +89,7 @@ class DatabaseManager:
         path = self._paths[collection]
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
 
     def update(self, collection: str, mutate: Callable[[Any], Any]) -> Any:

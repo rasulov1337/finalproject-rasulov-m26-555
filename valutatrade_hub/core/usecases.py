@@ -1,14 +1,14 @@
 """Бизнес-логика приложения: сессия пользователя, портфель, сделки и курсы валют.
 
-Ключевые изменения раздела 3:
+Архитектура раздела 4:
 
-- валидация валют через реестр ``currencies.get_currency()``;
-- пользовательские исключения из ``core/exceptions.py``
-  (``CurrencyNotFoundError``, ``ApiRequestError``, ``InsufficientFundsError``);
-- хранилище и конфигурация — через синглтоны ``DatabaseManager``
-  и ``SettingsLoader`` (безопасное «чтение → модификация → запись»);
-- операции ``register``/``login``/``buy``/``sell`` логируются декоратором
-  ``@log_action`` (``logs/actions.log``).
+- Core Service **не ходит в сеть**: ``RateService`` только читает кеш
+  ``data/rates.json``, который пишет Parser Service (команда ``update-rates``);
+- пустой кеш → ``RatesNotAvailableError`` с предложением выполнить
+  ``update-rates``; устаревший (TTL из ``SettingsLoader``) → курсы
+  используются, но к выводу добавляется предупреждение;
+- ``AppService.update_rates`` запускает Parser Service (однократно или
+  по расписанию), ``AppService.show_rates`` строит таблицу курсов из кеша.
 
 CLI (``valutatrade_hub/cli/interface.py``) не дублирует бизнес-логику —
 он лишь разбирает аргументы и вызывает методы ``AppService``.
@@ -16,25 +16,27 @@ CLI (``valutatrade_hub/cli/interface.py``) не дублирует бизнес-
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+
+from prettytable import PrettyTable
 
 from ..decorators import log_action
 from ..infra.database import DatabaseManager
 from ..infra.settings import SettingsLoader
 from ..logging_config import setup_logging
+from ..parser_service.scheduler import run_forever
+from ..parser_service.updater import RatesUpdater, UpdateResult
 from . import currencies
 from .currencies import get_currency
 from .exceptions import (
-    ApiRequestError,
     CurrencyNotFoundError,
     InsufficientFundsError,
     NotLoggedInError,
+    RatesNotAvailableError,
     UnknownBaseCurrencyError,
-    UserNotFoundError,
     UsernameTakenError,
+    UserNotFoundError,
     ValidationError,
     WalletNotFoundError,
     WrongPasswordError,
@@ -52,47 +54,19 @@ from .utils import (
     validate_amount,
     validate_currency_code,
     validate_password,
+    validate_positive_int,
     validate_username,
 )
 
-# ---------------------------------------------------------------------------
-# Хранилище (users.json / portfolios.json) — через синглтон DatabaseManager
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Единый контракт сервиса парсинга (Parser Service)
-# ---------------------------------------------------------------------------
-
-
-class ParserClient(Protocol):
-    """Контракт источника курсов: свежие курсы всех валют к USD.
-
-    Чтобы подключить реальный Parser Service, достаточно реализовать этот
-    протокол (например, HTTP-клиентом) и передать его в ``RateService``.
-    """
-
-    source: str
-
-    def fetch_rates(self) -> dict[str, float]:
-        """Вернуть словарь «код валюты → сколько USD стоит 1 единица»."""
-        ...
-
-
-class StubParserClient:
-    """Заглушка Parser Service: фиксированные курсы из ``utils.STUB_USD_RATES``."""
-
-    source = "ParserService"
-
-    def fetch_rates(self) -> dict[str, float]:
-        return dict(STUB_USD_RATES)
-
-
-# ---------------------------------------------------------------------------
-# Сервис курсов: кеш data/rates.json + обращение к Parser Service
-# ---------------------------------------------------------------------------
+#: Предупреждение, которое Core добавляет к выводу при устаревшем кеше.
+STALE_RATES_WARNING = "Внимание: кеш курсов устарел — выполните update-rates."
 
 _PAIR_SUFFIX = "_USD"
+
+
+# ---------------------------------------------------------------------------
+# Сервис курсов: чтение кеша data/rates.json (пишет его Parser Service)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -117,102 +91,78 @@ class _CacheSnapshot:
 
     rates: dict[str, float]
     timestamps: dict[str, datetime]
-    source: str
+    sources: dict[str, str]
     last_refresh: datetime | None
 
 
 class RateService:
-    """Получение курсов: сначала кеш ``data/rates.json``, затем Parser Service.
+    """Чтение кеша курсов из ``data/rates.json`` (обновляет его Parser Service).
 
-    TTL свежести кеша и пути к файлам берутся из ``SettingsLoader`` и
-    ``DatabaseManager``. Курсы хранятся как «1 единица валюты → USD»;
-    курс произвольной пары A→B считается кросс-курсом через USD.
+    Поддерживает актуальный формат ``{"pairs": {...}, "last_refresh": ...}``
+    и предыдущий плоский формат (пары на верхнем уровне) — при переходе
+    на новый формат данные не теряются.
 
-    Ошибки: ``ApiRequestError`` — сбой Parser Service, ``CurrencyNotFoundError`` —
-    код валюты отсутствует в полученных курсах.
+    Курсы хранятся как «1 единица валюты → USD»; курс произвольной пары
+    A→B считается кросс-курсом: ``rates[A] / rates[B]``.
     """
 
-    def __init__(self, client: ParserClient | None = None, ttl: timedelta | None = None) -> None:
-        self._client: ParserClient = client if client is not None else StubParserClient()
+    def __init__(self, ttl: timedelta | None = None) -> None:
         if ttl is None:
             ttl = timedelta(seconds=SettingsLoader().rates_ttl_seconds)
         self._ttl = ttl
 
     # -- публичный API -----------------------------------------------------
 
+    def get_snapshot(self) -> _CacheSnapshot:
+        """Снимок кеша; пустой кеш → ``RatesNotAvailableError``."""
+        snapshot = self._load_cache()
+        if snapshot is None or not snapshot.rates:
+            raise RatesNotAvailableError(
+                "Локальный кеш курсов пуст. Выполните 'update-rates', чтобы загрузить данные."
+            )
+        return snapshot
+
     def get_usd_rates(self) -> dict[str, float]:
-        """Свежие курсы всех валют к USD (из кеша или после обновления)."""
-        return self._snapshot().rates
+        """Курсы всех валют к USD из кеша."""
+        return self.get_snapshot().rates
 
     def get_pair_rate(self, from_currency: str, to_currency: str) -> RateInfo:
-        """Получить курс пары валют, при необходимости обновив кеш."""
+        """Курс пары валют из кеша.
+
+        :raises RatesNotAvailableError: кеш пуст;
+        :raises CurrencyNotFoundError: один из кодов отсутствует в кеше.
+        """
         from_c = validate_currency_code(from_currency)
         to_c = validate_currency_code(to_currency)
-        snapshot = self._snapshot()  # ApiRequestError при полном сбое
-        rate = cross_rate(snapshot.rates, from_c, to_c)  # CurrencyNotFoundError
+        snapshot = self.get_snapshot()
+        rate = cross_rate(snapshot.rates, from_c, to_c)
         stamps = [snapshot.timestamps.get(code) for code in (from_c, to_c)]
         stamps = [stamp for stamp in stamps if stamp is not None]
         updated_at = min(stamps) if stamps else now()
-        return RateInfo(from_c, to_c, rate, updated_at, snapshot.source)
+        source = snapshot.sources.get(from_c) or snapshot.sources.get(to_c) or "rates.json"
+        return RateInfo(from_c, to_c, rate, updated_at, source)
 
-    def refresh(self, force: bool = False) -> str:
-        """Обновить кеш курсов через Parser Service."""
-        cached = self._load_cache()
-        if not force and cached is not None and self._is_fresh(cached):
-            return f"Курсы актуальны, обновление не требуется (источник: {cached.source})"
-        rates = self._fetch_from_client()  # ApiRequestError при сбое
-        self._save_cache(rates, self._client.source)
-        return f"Курсы обновлены: {len(rates)} валют (источник: {self._client.source})"
+    def is_cache_stale(self) -> bool:
+        """Кеш устарел: ``last_refresh`` старше TTL (или кеша нет вовсе)."""
+        snapshot = self._load_cache()
+        return snapshot is None or self._is_stale(snapshot)
 
     # -- внутренние методы ---------------------------------------------------
 
-    def _snapshot(self) -> _CacheSnapshot:
-        """Вернуть снимок курсов: свежий кеш → Parser Service → устаревший кеш."""
-        cached = self._load_cache()
-        if cached is not None and self._is_fresh(cached):
-            return cached
-        try:
-            rates = self._fetch_from_client()
-        except ApiRequestError:
-            if cached is not None:
-                return cached  # устаревший кеш лучше, чем ничего
-            raise
-        self._save_cache(rates, self._client.source)
-        refreshed = self._load_cache()
-        if refreshed is not None:
-            return refreshed
-        return _CacheSnapshot(rates, {code: now() for code in rates}, self._client.source, now())
-
-    def _fetch_from_client(self) -> dict[str, float]:
-        """Запросить курсы у Parser Service и проверить ответ."""
-        try:
-            raw = self._client.fetch_rates()
-        except ApiRequestError:
-            raise
-        except Exception as exc:
-            raise ApiRequestError(f"сервис парсинга недоступен ({exc})") from exc
-        if not isinstance(raw, Mapping) or not raw:
-            raise ApiRequestError("пустой ответ от Parser Service")
-        rates: dict[str, float] = {"USD": 1.0}
-        for code, value in raw.items():
-            try:
-                currency = validate_currency_code(code)
-                rate = float(value)
-            except (ValidationError, TypeError, ValueError) as exc:
-                raise ApiRequestError(f"некорректные данные курса для '{code}'") from exc
-            if rate <= 0:
-                raise ApiRequestError(f"некорректный курс для {currency}")
-            rates[currency] = rate
-        return rates
+    def _is_stale(self, snapshot: _CacheSnapshot) -> bool:
+        return snapshot.last_refresh is None or (now() - snapshot.last_refresh) >= self._ttl
 
     def _load_cache(self) -> _CacheSnapshot | None:
-        """Прочитать кеш курсов из data/rates.json (через DatabaseManager)."""
+        """Прочитать кеш из data/rates.json (через DatabaseManager)."""
         data = DatabaseManager().load("rates", {})
         if not isinstance(data, dict) or not data:
             return None
+        pairs = data.get("pairs")
+        raw_pairs = pairs if isinstance(pairs, dict) else data  # плоский формат
         rates: dict[str, float] = {}
         timestamps: dict[str, datetime] = {}
-        for key, entry in data.items():
+        sources: dict[str, str] = {}
+        for key, entry in raw_pairs.items():
             if not (isinstance(key, str) and key.endswith(_PAIR_SUFFIX)):
                 continue
             if not (isinstance(entry, dict) and "rate" in entry):
@@ -225,33 +175,20 @@ class RateService:
             except (TypeError, ValueError):
                 continue
             timestamps[code] = parse_dt(entry.get("updated_at")) or now()
+            sources[code] = str(entry.get("source", "rates.json"))
         if not rates:
             return None
+        # Базовая валюта USD — опорная единица всех кросс-курсов.
+        if "USD" not in rates:
+            rates["USD"] = 1.0
+            timestamps.setdefault("USD", parse_dt(data.get("last_refresh")) or now())
+            sources.setdefault("USD", "base")
         return _CacheSnapshot(
             rates=rates,
             timestamps=timestamps,
-            source=str(data.get("source", "rates.json")),
+            sources=sources,
             last_refresh=parse_dt(data.get("last_refresh")),
         )
-
-    def _is_fresh(self, snapshot: _CacheSnapshot) -> bool:
-        """Кеш свежий, если last_refresh моложе TTL и курсы не пустые."""
-        return (
-            snapshot.last_refresh is not None
-            and (now() - snapshot.last_refresh) < self._ttl
-            and bool(snapshot.rates)
-        )
-
-    def _save_cache(self, rates: dict[str, float], source: str) -> None:
-        """Записать курсы в data/rates.json в формате из ТЗ."""
-        stamp = to_iso(now())
-        payload: dict[str, Any] = {
-            f"{code}{_PAIR_SUFFIX}": {"rate": rate, "updated_at": stamp}
-            for code, rate in sorted(rates.items())
-        }
-        payload["source"] = source
-        payload["last_refresh"] = stamp
-        DatabaseManager().save("rates", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +212,7 @@ class AppService:
         self._current_portfolio: Portfolio | None = None
         #: Контекст последней операции для декоратора @log_action
         #: (rate, before/after — состояние кошелька).
-        self._last_action_context: dict[str, Any] = {}
+        self._last_action_context: dict[str, object] = {}
 
     @property
     def current_user(self) -> User | None:
@@ -300,10 +237,10 @@ class AppService:
         raw = self._db.load("users", [])
         return [User.from_dict(item) for item in raw if isinstance(item, dict)]
 
-    def _update_users(self, mutate: Callable[[list[User]], list[User]]) -> None:
+    def _update_users(self, mutate) -> None:
         """Безопасное обновление users.json: чтение → модификация → запись."""
 
-        def raw_mutate(raw: Any) -> Any:
+        def raw_mutate(raw):
             users = [User.from_dict(item) for item in raw if isinstance(item, dict)]
             return [user.to_dict() for user in mutate(users)]
 
@@ -313,10 +250,10 @@ class AppService:
         raw = self._db.load("portfolios", [])
         return [Portfolio.from_dict(item) for item in raw if isinstance(item, dict)]
 
-    def _update_portfolios(self, mutate: Callable[[list[Portfolio]], list[Portfolio]]) -> None:
+    def _update_portfolios(self, mutate) -> None:
         """Безопасное обновление portfolios.json: чтение → модификация → запись."""
 
-        def raw_mutate(raw: Any) -> Any:
+        def raw_mutate(raw):
             portfolios = [Portfolio.from_dict(item) for item in raw if isinstance(item, dict)]
             return [portfolio.to_dict() for portfolio in mutate(portfolios)]
 
@@ -327,7 +264,9 @@ class AppService:
 
         def mutate(portfolios: list[Portfolio]) -> list[Portfolio]:
             exists = any(item.user_id == portfolio.user_id for item in portfolios)
-            updated = [portfolio if item.user_id == portfolio.user_id else item for item in portfolios]
+            updated = [
+                portfolio if item.user_id == portfolio.user_id else item for item in portfolios
+            ]
             if not exists:
                 updated.append(portfolio)
             return updated
@@ -421,9 +360,7 @@ class AppService:
             wallet = wallets[code]
             rate = usd_rates.get(code)
             if rate is None:
-                lines.append(
-                    f"- {code}: {format_amount(wallet.balance, code)}  → курс недоступен"
-                )
+                lines.append(f"- {code}: {format_amount(wallet.balance, code)}  → курс недоступен")
                 missing.append(code)
                 continue
             value = wallet.balance * rate / base_rate
@@ -436,6 +373,8 @@ class AppService:
         lines.append(f"ИТОГО: {format_amount(total, base)} {base}")
         if missing:
             lines.append(f"Курс недоступен для: {', '.join(missing)} (в итоге не учтено)")
+        if self._rates.is_cache_stale():
+            lines.append(STALE_RATES_WARNING)
         return "\n".join(lines)
 
     def add_currency(self, currency: str) -> str:
@@ -451,7 +390,7 @@ class AppService:
 
     def deposit(self, currency: str, amount: float) -> str:
         """Пополнить кошелёк указанной валюты (демо-режим симулятора)."""
-        user, portfolio = self._require_login()
+        _, portfolio = self._require_login()
         code = get_currency(currency).code
         amount = validate_amount(amount)
         existed = portfolio.get_wallet(code) is not None
@@ -473,9 +412,9 @@ class AppService:
         """Купить валюту: пополнить её кошелёк и списать стоимость с USD-кошелька.
 
         :raises CurrencyNotFoundError: валюта отсутствует в реестре;
-        :raises ApiRequestError: не удалось получить курс.
+        :raises RatesNotAvailableError: кеш пуст или курс не найден в кеше.
         """
-        user, portfolio = self._require_login()
+        _, portfolio = self._require_login()
         self._last_action_context = {}
         code = get_currency(currency).code
         amount = validate_amount(amount)
@@ -492,14 +431,18 @@ class AppService:
         }
 
         lines = [
-            f"Покупка выполнена: {format_amount(amount, code)} {code} "
-            f"по курсу {format_rate(rate_info.rate)} USD/{code}"
+            (
+                f"Покупка выполнена: {format_amount(amount, code)} {code} "
+                f"по курсу {format_rate(rate_info.rate)} USD/{code}"
+            )
         ]
         if not existed:
             lines.append(f"Создан кошелёк '{code}'")
         changes = [
-            f"- {code}: было {format_amount(before, code)} → "
-            f"стало {format_amount(wallet.balance, code)}"
+            (
+                f"- {code}: было {format_amount(before, code)} → "
+                f"стало {format_amount(wallet.balance, code)}"
+            )
         ]
 
         # При покупке сумма списывается с USD-кошелька,
@@ -521,13 +464,13 @@ class AppService:
         if paid:
             lines.append(f"Списано с USD-кошелька: {format_amount(cost)} USD")
         elif code == "USD":
-            lines.append(
-                f"Оценочная стоимость покупки: {format_amount(cost)} USD (базовая валюта)"
-            )
+            lines.append(f"Оценочная стоимость покупки: {format_amount(cost)} USD (базовая валюта)")
         else:
             usd_wallet = portfolio.get_wallet("USD")
             note = "" if usd_wallet is None else " (на USD-кошельке недостаточно средств)"
             lines.append(f"Оценочная стоимость покупки: {format_amount(cost)} USD{note}")
+        if self._rates.is_cache_stale():
+            lines.append(STALE_RATES_WARNING)
         self._save_portfolio(portfolio)
         return "\n".join(lines)
 
@@ -537,9 +480,9 @@ class AppService:
 
         :raises WalletNotFoundError: кошелька с такой валютой нет;
         :raises InsufficientFundsError: на кошельке недостаточно средств;
-        :raises ApiRequestError: не удалось получить курс.
+        :raises RatesNotAvailableError: кеш пуст или курс не найден в кеше.
         """
-        user, portfolio = self._require_login()
+        _, portfolio = self._require_login()
         self._last_action_context = {}
         code = get_currency(currency).code
         amount = validate_amount(amount)
@@ -573,8 +516,10 @@ class AppService:
         usd_wallet.deposit(revenue)
 
         lines = [
-            f"Продажа выполнена: {format_amount(amount, code)} {code} "
-            f"по курсу {format_rate(rate_info.rate)} USD/{code}",
+            (
+                f"Продажа выполнена: {format_amount(amount, code)} {code} "
+                f"по курсу {format_rate(rate_info.rate)} USD/{code}"
+            ),
             "Изменения в портфеле:",
         ]
         if code == "USD":
@@ -595,38 +540,46 @@ class AppService:
             if not usd_existed:
                 lines.append("Создан USD-кошелёк (базовая валюта)")
         lines.append(f"Выручка зачислена на USD-кошелёк: {format_amount(revenue)} USD")
+        if self._rates.is_cache_stale():
+            lines.append(STALE_RATES_WARNING)
         self._save_portfolio(portfolio)
         return "\n".join(lines)
 
-    def _get_trade_rate(self, code: str) -> Any:
-        """Курс currency→USD для сделки; сбой отдаётся как ApiRequestError."""
+    def _get_trade_rate(self, code: str) -> RateInfo:
+        """Курс currency→USD для сделки из локального кеша."""
         try:
             return self._rates.get_pair_rate(code, "USD")
-        except (ApiRequestError, CurrencyNotFoundError):
-            raise ApiRequestError(f"не удалось получить курс для {code}→USD") from None
+        except CurrencyNotFoundError:
+            raise RatesNotAvailableError(f"Курс для '{code}' не найден в кеше.") from None
 
     # ------------------------------------------------------------------
     # Курсы
     # ------------------------------------------------------------------
 
     def get_rate(self, from_currency: str, to_currency: str) -> str:
-        """Получить текущий курс одной валюты к другой.
+        """Получить курс одной валюты к другой из локального кеша.
 
         :raises CurrencyNotFoundError: один из кодов отсутствует в реестре;
-        :raises ApiRequestError: сбой при получении курсов.
+        :raises RatesNotAvailableError: кеш пуст или пара не найдена в кеше.
         """
         from_c = get_currency(from_currency).code
         to_c = get_currency(to_currency).code
-        rate_info = self._rates.get_pair_rate(from_c, to_c)
-        return (
-            f"Курс {from_c}→{to_c}: {format_rate(rate_info.rate)} "
-            f"(обновлено: {format_dt(rate_info.updated_at)})\n"
-            f"Обратный курс {to_c}→{from_c}: {format_rate(rate_info.reverse_rate)}"
-        )
-
-    def refresh_rates(self) -> str:
-        """Принудительно обновить кеш курсов через Parser Service."""
-        return self._rates.refresh(force=True)
+        try:
+            rate_info = self._rates.get_pair_rate(from_c, to_c)
+        except CurrencyNotFoundError as exc:
+            raise RatesNotAvailableError(
+                f"Курс для '{exc.currency_code}' не найден в кеше."
+            ) from None
+        lines = [
+            (
+                f"Курс {from_c}→{to_c}: {format_rate(rate_info.rate)} "
+                f"(обновлено: {format_dt(rate_info.updated_at)})"
+            ),
+            f"Обратный курс {to_c}→{from_c}: {format_rate(rate_info.reverse_rate)}",
+        ]
+        if self._rates.is_cache_stale():
+            lines.append(STALE_RATES_WARNING)
+        return "\n".join(lines)
 
     def list_currencies(self) -> str:
         """Список поддерживаемых валют (для команды currencies)."""
@@ -635,3 +588,150 @@ class AppService:
             lines.append(f"  {currency.get_display_info()}")
         lines.append("Сделки и курсы доступны только для валют из этого списка.")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Parser Service: обновление и просмотр курсов
+    # ------------------------------------------------------------------
+
+    def update_rates(self, source: str | None = None, interval: int | str | None = None) -> None:
+        """Обновить курсы через Parser Service (однократно или по расписанию).
+
+        ``interval`` задан → планировщик: обновлять каждые N секунд,
+        выход по Ctrl+C. Результат каждого цикла печатается сразу.
+        """
+        source = self._validate_source(source)
+        updater = RatesUpdater()
+        if interval is not None:
+            interval_seconds = validate_positive_int(interval, "interval")
+
+            def on_update(result: UpdateResult) -> None:
+                print(self.render_update_result(result))
+
+            run_forever(updater, interval_seconds, source=source, on_update=on_update)
+            print("Stopped by user.")
+            return
+        print(self.render_update_result(updater.run_update(source)))
+
+    @staticmethod
+    def render_update_result(result: UpdateResult) -> str:
+        """Строки вывода команды update-rates (формат из ТЗ, раздел 4.6)."""
+        lines = ["INFO: Starting rates update..."]
+        for item in result.results:
+            if item.ok:
+                lines.append(
+                    f"INFO: Fetching from {item.client_name}... OK ({item.rates_count} rates)"
+                )
+            else:
+                lines.append(f"ERROR: Failed to fetch from {item.client_name}: {item.error}")
+        if result.entries_count:
+            lines.append(f"INFO: Writing {result.entries_count} rates to data/rates.json...")
+        if result.all_ok:
+            lines.append(
+                f"Update successful. Total rates updated: {result.total_written}. "
+                f"Last refresh: {result.last_refresh}"
+            )
+        elif result.entries_count:
+            lines.append("Update completed with errors. Check logs/parser.log for details.")
+        else:
+            lines.append("Update failed. Check logs/parser.log for details.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _validate_source(source: str | None) -> str | None:
+        """Проверить значение --source: None, 'coingecko' или 'exchangerate'."""
+        if source is None:
+            return None
+        normalized = str(source).strip().lower()
+        if normalized not in {"coingecko", "exchangerate"}:
+            raise ValidationError(
+                f"'source' должен быть 'coingecko' или 'exchangerate' (получено: '{source}')"
+            )
+        return normalized
+
+    def show_rates(
+        self,
+        currency: str | None = None,
+        top: int | str | None = None,
+        base_currency: str | None = None,
+    ) -> str:
+        """Таблица курсов из локального кеша (команда show-rates).
+
+        Приоритет фильтров: ``--currency`` → ``--top`` → ``--base`` → все пары.
+        """
+        snapshot = self._rates.get_snapshot()
+        updated_header = to_iso(snapshot.last_refresh) if snapshot.last_refresh else "unknown"
+        table = PrettyTable(field_names=["Pair", "Rate", "Updated"])
+        table.align["Pair"] = "l"
+        rows = self._rates_rows(snapshot, currency=currency, top=top, base_currency=base_currency)
+        for row in rows:
+            table.add_row(row)
+        lines = [f"Rates from cache (updated at {updated_header}):", table.get_string()]
+        if self._rates.is_cache_stale():
+            lines.append(STALE_RATES_WARNING)
+        return "\n".join(lines)
+
+    def _rates_rows(
+        self,
+        snapshot: _CacheSnapshot,
+        currency: str | None,
+        top: int | str | None,
+        base_currency: str | None,
+    ) -> list[tuple[str, str, str]]:
+        """Строки таблицы show-rates с учётом фильтров."""
+        if currency is not None:
+            code = validate_currency_code(currency)
+            if code not in snapshot.rates:
+                raise RatesNotAvailableError(f"Курс для '{code}' не найден в кеше.")
+            return [
+                (f"{code}_USD", format_rate(snapshot.rates[code]), self._updated_at(snapshot, code))
+            ]
+        if top is not None:
+            limit = validate_positive_int(top, "top")
+            crypto_codes = {
+                item.code
+                for item in currencies.list_currencies()
+                if isinstance(item, currencies.CryptoCurrency)
+            }
+            ranked = sorted(
+                ((code, rate) for code, rate in snapshot.rates.items() if code in crypto_codes),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            return [
+                (f"{code}_USD", format_rate(rate), self._updated_at(snapshot, code))
+                for code, rate in ranked[:limit]
+            ]
+        if base_currency is not None:
+            base = validate_currency_code(base_currency)
+            if base not in snapshot.rates:
+                raise RatesNotAvailableError(f"Курс для '{base}' не найден в кеше.")
+            return [
+                (
+                    f"{code}_{base}",
+                    format_rate(cross_rate(snapshot.rates, code, base)),
+                    self._updated_at(snapshot, code),
+                )
+                for code in sorted(snapshot.rates)
+                if code != base
+            ]
+        return [
+            (f"{code}_USD", format_rate(rate), self._updated_at(snapshot, code))
+            for code, rate in sorted(snapshot.rates.items())
+            if code != "USD"
+        ]
+
+    @staticmethod
+    def _updated_at(snapshot: _CacheSnapshot, code: str) -> str:
+        """Время обновления курса валюты для таблицы show-rates."""
+        stamp = snapshot.timestamps.get(code) or snapshot.last_refresh or now()
+        return format_dt(stamp)
+
+
+# Экспорт для обратной совместимости тестов и отладки.
+__all__ = [
+    "STALE_RATES_WARNING",
+    "STUB_USD_RATES",
+    "AppService",
+    "RateInfo",
+    "RateService",
+]

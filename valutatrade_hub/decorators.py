@@ -5,7 +5,7 @@
 
 .. code-block:: text
 
-    BUY user='alice' currency='BTC' amount=0.0500 rate=59337.21 base='USD' before=0.0000 after=0.0500 result=OK
+    BUY user='alice' currency='BTC' amount=0.0500 rate=59337.21 after=0.0500 result=OK
 
 При исключении запись фиксируется с ``result=ERROR`` и полями
 ``error_type``/``error_message``, после чего исключение пробрасывается дальше —
