@@ -24,20 +24,30 @@ finalproject-rasulov-m26-555/
 │    ├── users.json             # список пользователей
 │    ├── portfolios.json        # портфели и кошельки
 │    └── rates.json             # кеш курсов валют
+├── logs/
+│    └── actions.log            # журнал операций (ротация 1 МБ × 3)
 ├── valutatrade_hub/
 │    ├── __init__.py
+│    ├── logging_config.py      # настройка логов (формат, уровень, ротация)
+│    ├── decorators.py          # @log_action — трассировка доменных операций
 │    ├── core/
 │    │    ├── __init__.py
+│    │    ├── currencies.py     # иерархия Currency → Fiat/Crypto + реестр
+│    │    ├── exceptions.py     # пользовательские исключения
 │    │    ├── models.py         # классы User, Wallet, Portfolio
-│    │    ├── utils.py          # валидация, хеширование, JSON-хранилище, форматирование
-│    │    └── usecases.py       # бизнес-логика: AppService, RateService, контракт Parser Service
+│    │    ├── usecases.py       # бизнес-логика: AppService, RateService
+│    │    └── utils.py          # валидация, хеширование, конвертации, форматирование
+│    ├── infra/
+│    │    ├── __init__.py
+│    │    ├── settings.py       # Singleton SettingsLoader (конфигурация)
+│    │    └── database.py       # Singleton DatabaseManager (JSON-хранилище)
 │    └── cli/
 │         ├── __init__.py
 │         └── interface.py      # команды CLI
 │
 ├── main.py                     # точка входа
 ├── uv.lock
-├── pyproject.toml
+├── pyproject.toml              # метаданные + секция [tool.valutatrade]
 ├── README.md
 └── .gitignore
 ```
@@ -51,7 +61,7 @@ finalproject-rasulov-m26-555/
 ## Запуск
 
 ```bash
-uv sync                       # создать окружение и сгенерировать uv.lock (при необходимости)
+uv sync                       # создать окружение (uv.lock уже в репозитории)
 uv run main.py                # интерактивный режим (REPL)
 uv run valutatrade-hub        # то же самое через консольную точку входа
 ```
@@ -68,9 +78,6 @@ python3 main.py
 uv run main.py get-rate --from USD --to BTC
 ```
 
-Каталог данных можно переопределить переменной окружения
-`VALUTATRADE_DATA_DIR` (по умолчанию — `data/` в корне проекта).
-
 ## Команды
 
 | Команда | Описание |
@@ -84,71 +91,104 @@ uv run main.py get-rate --from USD --to BTC
 | `buy --currency <код> --amount <кол-во>` | Купить валюту (кошелёк создаётся автоматически) |
 | `sell --currency <код> --amount <кол-во>` | Продать валюту (выручка зачисляется в USD) |
 | `get-rate --from <код> --to <код>` | Показать курс валюты к валюте и обратный курс |
+| `currencies` | Список поддерживаемых валют (фиат и крипто) |
 | `add-currency --currency <код>` | Добавить пустой кошелёк |
 | `deposit --currency <код> --amount <кол-во>` | Пополнить кошелёк (демо-режим) |
 | `refresh-rates` | Принудительно обновить курсы через Parser Service |
 | `help` / `exit` | Справка / выход |
 
-## Пример сессии
+## Иерархия валют (раздел 3.1)
+
+Валюты — закрытый реестр: сделки, курсы и кошельки работают только с
+валютами из `core/currencies.py`. Новая валюта добавляется одной записью в
+`_REGISTRY_DATA` (и, при необходимости, курсом в `utils.STUB_USD_RATES`).
+
+- абстрактный базовый класс `Currency`: публичные атрибуты `name`, `code`;
+  инварианты — код в верхнем регистре, 2–5 символов, без пробелов; имя —
+  непустая строка;
+- `FiatCurrency` добавляет `issuing_country`;
+- `CryptoCurrency` добавляет `algorithm` и `market_cap`;
+- фабрика `get_currency(code)` возвращает объект валюты (регистр не важен),
+  для неизвестного кода бросает `CurrencyNotFoundError`;
+- `Wallet.currency` — свойство-интеграция: полиморфный объект валюты кошелька.
 
 ```text
-> register --username alice --password 1234
-Пользователь 'alice' зарегистрирован (id=1). Войдите: login --username alice --password ****
-
-> login --username alice --password 1234
-Вы вошли как 'alice'
-
-alice> buy --currency BTC --amount 0.05
-Покупка выполнена: 0.0500 BTC по курсу 59337.21 USD/BTC
-Создан кошелёк 'BTC'
-Изменения в портфеле:
-- BTC: было 0.0000 → стало 0.0500
-Оценочная стоимость покупки: 2,966.86 USD
-
-alice> show-portfolio
-Портфель пользователя 'alice' (база: USD):
-- USD: 0.00  → 0.00 USD
-- BTC: 0.0500  → 2,966.86 USD
----------------------------------
-ИТОГО: 2,966.86 USD
-
-alice> sell --currency BTC --amount 0.01
-Продажа выполнена: 0.0100 BTC по курсу 59337.21 USD/BTC
-Изменения в портфеле:
-- BTC: было 0.0500 → стало 0.0400
-- USD: было 0.00 → стало 593.37
-Создан USD-кошелёк (базовая валюта)
-Выручка зачислена на USD-кошелёк: 593.37 USD
-
-alice> get-rate --from USD --to BTC
-Курс USD→BTC: 0.00001685 (обновлено: 2025-10-22 10:00:00)
-Обратный курс BTC→USD: 59337.21
+> currencies
+Поддерживаемые валюты:
+  [FIAT] CNY — Chinese Yuan (Issuing: China)
+  ...
+  [FIAT] USD — US Dollar (Issuing: United States)
+  [CRYPTO] BTC — Bitcoin (Algo: SHA-256, MCAP: 1.12e12)
+  ...
 ```
+
+## Пользовательские исключения (раздел 3.2)
+
+Все исключения наследуются от `ValutaTradeError` (модуль
+`core/exceptions.py`); CLI печатает их сообщения как есть и добавляет
+подсказки:
+
+| Исключение | Сообщение | Где возникает |
+| --- | --- | --- |
+| `InsufficientFundsError` | `Недостаточно средств: доступно {available} {code}, требуется {required} {code}` | `Wallet.withdraw()`, `sell` |
+| `CurrencyNotFoundError` | `Неизвестная валюта '{code}'` (+ список кодов) | `get_currency()`, `buy`/`sell`/`get-rate` |
+| `ApiRequestError` | `Ошибка при обращении к внешнему API: {reason}` (+ «повторите позже») | слой получения курсов |
+
+## Конфигурация и синглтоны (раздел 3.3)
+
+`SettingsLoader` (singleton через `__new__` — проще и читабельнее
+метакласса) читает секцию `[tool.valutatrade]` из `pyproject.toml`.
+Приоритет: переменные окружения `VALUTATRADE_*` → pyproject.toml → дефолты.
+
+| Ключ | По умолчанию | Смысл |
+| --- | --- | --- |
+| `data_dir` | `data` | каталог JSON-хранилищ |
+| `logs_dir` | `logs` | каталог логов |
+| `rates_ttl_seconds` | `300` | сколько секунд кеш курсов считается свежим |
+| `default_base_currency` | `USD` | базовая валюта по умолчанию |
+| `log_level` | `INFO` | уровень логирования (отладка — `DEBUG`) |
+| `log_max_bytes` | `1048576` | размер `logs/actions.log` до ротации |
+| `log_backup_count` | `3` | количество файлов ротации |
+
+Пример: `VALUTATRADE_DATA_DIR=/tmp/vt VALUTATRADE_RATES_TTL_SECONDS=60 uv run main.py`
+
+`DatabaseManager` (тоже singleton) — единая точка доступа к `data/*.json`:
+атомарная запись через временный файл и безопасная операция
+`update(collection, mutate)` «чтение → модификация → запись»: если мутация
+бросила исключение, файл не перезаписывается. Синглтоны используются в
+`AppService`, `RateService` (TTL) и `Portfolio.user`.
+
+## Логирование операций (раздел 3.4)
+
+`@log_action` (модуль `decorators.py`) применяется к `register`, `login`,
+`buy`, `sell` в `usecases.py`. Формат — текстовый, одна строка на событие:
+
+```text
+INFO 2026-10-09T12:05:22 BUY user='alice' currency='BTC' amount=0.0500 base='USD' rate=59337.21 before=0.0000 after=0.0500 result=OK
+INFO 2026-10-09T12:06:10 SELL user='alice' currency='BTC' amount=99.0000 base='USD' result=ERROR error_type=InsufficientFundsError error_message='Недостаточно средств: ...'
+```
+
+Поля: timestamp, действие, пользователь, валюта, сумма, курс, базовая
+валюта, результат (`OK`/`ERROR`), при ошибке — `error_type`/`error_message`.
+Опция `verbose=True` (включена для `buy`/`sell`) добавляет состояние
+кошелька «было→стало» (`before`/`after`). Декоратор не глотает исключения:
+ошибка фиксируется в лог и пробрасывается дальше. Ротация —
+`RotatingFileHandler` (1 МБ, 3 бэкапа), уровень из настроек, в stdout лог
+не пишется.
 
 ## Как работают курсы
 
 Курсы хранятся как «1 единица валюты → USD» (например, `BTC_USD: 59337.21`).
 Курс произвольной пары A→B считается кросс-курсом через USD:
-`rates[A] / rates[B]`.
+`rates[A] / rates[B]` (утилита `cross_rate`).
 
-Порядок получения курса (команда `get-rate` и сделки):
+Порядок получения курса (`get-rate` и сделки):
 
 1. берём курс из локального кеша `data/rates.json`;
-2. если кеш свежий (моложе 5 минут) — используем его;
+2. если кеш свежий (моложе `rates_ttl_seconds`) — используем его;
 3. иначе запрашиваем у Parser Service (заглушка), обновляем кеш и показываем курс;
-4. если данных нет и сервис недоступен — выводим ошибку
-   `Курс A→B недоступен. Повторите попытку позже.`
-
-Кеш обновляется целиком, формат `data/rates.json`:
-
-```json
-{
-  "EUR_USD": {"rate": 1.0786, "updated_at": "2025-10-09T10:30:00"},
-  "BTC_USD": {"rate": 59337.21, "updated_at": "2025-10-09T10:29:42"},
-  "source": "ParserService",
-  "last_refresh": "2025-10-09T10:35:00"
-}
-```
+4. при сбое сервиса — `ApiRequestError`, но если есть хотя бы устаревший
+   кеш, используется он.
 
 ### Единый контракт Parser Service
 
@@ -178,7 +218,8 @@ class ParserClient(Protocol):
   (он создаётся автоматически при первой продаже).
 - Пароль хранится только в виде одностороннего псевдо-хеша
   `sha256(password + salt)`; соль генерируется для каждого пользователя
-  и хранится рядом в `users.json`.
+  и хранится рядом в `users.json`. Хеш и соль — приватные атрибуты
+  пользователя (name mangling).
 
 ## Формат данных
 
@@ -209,4 +250,15 @@ class ParserClient(Protocol):
     }
   }
 ]
+```
+
+`data/rates.json` (кеш курсов):
+
+```json
+{
+  "EUR_USD": {"rate": 1.0786, "updated_at": "2025-10-09T10:30:00"},
+  "BTC_USD": {"rate": 59337.21, "updated_at": "2025-10-09T10:29:42"},
+  "source": "ParserService",
+  "last_refresh": "2025-10-09T10:35:00"
+}
 ```

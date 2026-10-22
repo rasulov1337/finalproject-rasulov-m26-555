@@ -1,35 +1,35 @@
-"""Вспомогательные функции: валидация, хеширование паролей, JSON-хранилище, форматирование.
+"""Вспомогательные функции: валидация, хеширование паролей, форматирование, разбор аргументов.
 
-Модуль зависит только от стандартной библиотеки, поэтому его используют и модели
-(``models.py``), и бизнес-логика (``usecases.py``), и CLI (``interface.py``).
+Модуль зависит только от ``exceptions`` и стандартной библиотеки, поэтому его
+используют модели, валюты, бизнес-логика и CLI. Персистентность (пути к
+файлам, чтение/запись JSON) живёт в ``infra/database.py``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import math
-import os
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .exceptions import CurrencyNotFoundError, ValidationError
 
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
 
-#: Допустимый формат кода валюты: 2–10 заглавных букв/цифр (USD, BTC, USDT...).
-CURRENCY_CODE_RE = re.compile(r"^[A-Z0-9]{2,10}$")
+#: Допустимый формат кода валюты: 2–5 заглавных букв/цифр, без пробелов.
+CURRENCY_CODE_RE = re.compile(r"^[A-Z0-9]{2,5}$")
 
 #: Валюты, суммы в которых показываем с 4 знаками после запятой.
 CRYPTO_CURRENCIES = {"BTC", "ETH", "USDT", "TON", "SOL", "XRP", "DOGE", "BNB"}
 
 #: Заглушка курсов Parser Service: сколько USD стоит 1 единица валюты.
-#: Используется, пока реальный сервис парсинга не подключён.
+#: Ключи должны покрывать весь реестр ``currencies._REGISTRY_DATA``.
 STUB_USD_RATES: dict[str, float] = {
     "USD": 1.0,
     "EUR": 1.0786,
@@ -43,68 +43,6 @@ STUB_USD_RATES: dict[str, float] = {
     "USDT": 1.0,
     "TON": 5.25,
 }
-
-
-class ValidationError(ValueError):
-    """Ошибка входных данных с понятным пользователю сообщением."""
-
-
-# ---------------------------------------------------------------------------
-# Каталог данных (data/)
-# ---------------------------------------------------------------------------
-
-
-def _default_data_dir() -> Path:
-    """Определить каталог с JSON-файлами данных.
-
-    Порядок: переменная окружения ``VALUTATRADE_DATA_DIR`` → каталог ``data/``
-    в корне исходников → ``./data`` от текущего каталога.
-    """
-    env = os.environ.get("VALUTATRADE_DATA_DIR")
-    if env:
-        return Path(env).expanduser()
-    project_root = Path(__file__).resolve().parents[2]
-    if (project_root / "pyproject.toml").is_file():
-        return project_root / "data"
-    return Path.cwd() / "data"
-
-
-DATA_DIR = _default_data_dir()
-USERS_FILE = DATA_DIR / "users.json"
-PORTFOLIOS_FILE = DATA_DIR / "portfolios.json"
-RATES_FILE = DATA_DIR / "rates.json"
-
-
-def ensure_data_files() -> None:
-    """Создать каталог ``data/`` и пустые JSON-файлы, если их ещё нет."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    for path, default in ((USERS_FILE, []), (PORTFOLIOS_FILE, []), (RATES_FILE, {})):
-        if not path.exists():
-            save_json(path, default)
-
-
-def load_json(path: Path, default: Any) -> Any:
-    """Прочитать JSON-файл; если файла нет — вернуть значение по умолчанию."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return default
-    if not text.strip():
-        return default
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValidationError(
-            f"Не удалось прочитать {path.name}: повреждённый JSON ({exc})"
-        ) from exc
-
-
-def save_json(path: Path, data: Any) -> None:
-    """Атомарно сохранить данные в JSON-файл (сначала во временный файл)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -182,15 +120,22 @@ def validate_password(value: str) -> str:
 
 
 def validate_currency_code(value: str) -> str:
-    """Код валюты: непустая строка в верхнем регистре (USD, BTC, ...)."""
+    """Код валюты: верхний регистр, 2–5 символов, без пробелов (USD, BTC...)."""
     if not isinstance(value, str) or not value.strip():
         raise ValidationError("Код валюты не может быть пустым")
     code = value.strip().upper()
     if not CURRENCY_CODE_RE.match(code):
         raise ValidationError(
-            f"Некорректный код валюты: '{value}' (ожидается, например, USD или BTC)"
+            f"Некорректный код валюты: '{value}' (ожидается 2–5 заглавных символов, например USD или BTC)"
         )
     return code
+
+
+def validate_non_empty_str(value: str, label: str) -> str:
+    """Непустая строка после отбрасывания пробелов (для имён и описаний)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{label} не может быть пустым")
+    return value.strip()
 
 
 def validate_amount(value: Any, name: str = "amount") -> float:
@@ -222,6 +167,33 @@ def format_rate(value: float) -> str:
     """Курс без лишних нулей: 59337.21, 1.0786, 0.01016, 0.00001685."""
     text = f"{float(value):.8f}".rstrip("0").rstrip(".")
     return text or "0"
+
+
+def format_market_cap(value: float) -> str:
+    """Капитализация в экспоненциальной форме: 1.12e12."""
+    return f"{float(value):.2e}".replace("e+", "e")
+
+
+# ---------------------------------------------------------------------------
+# Конвертация курсов
+# ---------------------------------------------------------------------------
+
+
+def cross_rate(usd_rates: Mapping[str, float], from_currency: str, to_currency: str) -> float:
+    """Кросс-курс from→to через USD: «сколько единиц to стоит 1 единица from».
+
+    :param usd_rates: словарь «код валюты → сколько USD стоит 1 единица»;
+    :raises CurrencyNotFoundError: один из кодов отсутствует в курсах;
+    :raises ValidationError: некорректный курс в данных (нулевое значение).
+    """
+    if from_currency not in usd_rates:
+        raise CurrencyNotFoundError(from_currency)
+    if to_currency not in usd_rates:
+        raise CurrencyNotFoundError(to_currency)
+    divider = float(usd_rates[to_currency])
+    if divider <= 0:
+        raise ValidationError(f"Некорректный курс для '{to_currency}'")
+    return float(usd_rates[from_currency]) / divider
 
 
 # ---------------------------------------------------------------------------

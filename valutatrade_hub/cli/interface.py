@@ -11,8 +11,10 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 
-from ..core.usecases import AppError, AppService
-from ..core.utils import FlagSpec, ValidationError, parse_flags
+from ..core import currencies as currency_registry
+from ..core.exceptions import ApiRequestError, CurrencyNotFoundError, ValutaTradeError
+from ..core.usecases import AppService
+from ..core.utils import FlagSpec, parse_flags
 
 EXIT_COMMANDS = {"exit", "quit", "q", "выход"}
 HELP_COMMANDS = {"help", "?", "помощь"}
@@ -105,6 +107,11 @@ COMMANDS: dict[str, Command] = {
             "to_currency": FlagSpec("--to", required=True),
         },
     ),
+    "currencies": Command(
+        usage="currencies",
+        description="Список поддерживаемых валют (фиат и крипто)",
+        handler="list_currencies",
+    ),
     "add-currency": Command(
         usage="add-currency --currency <код>",
         description="Добавить пустой кошелёк в портфель",
@@ -163,8 +170,16 @@ def execute(service: AppService, tokens: list[str]) -> bool:
         result = getattr(service, command.handler)(**kwargs)
         if result is not None:
             print(result)
-    except (AppError, ValidationError) as exc:
+    except ValutaTradeError as exc:
+        # Пользовательские исключения: базовое сообщение печатается как есть,
+        # отдельные типы дополняются подсказкой.
         print(exc)
+        if isinstance(exc, CurrencyNotFoundError):
+            supported = ", ".join(item.code for item in currency_registry.list_currencies())
+            print(f"Поддерживаемые коды: {supported}")
+            print("Полный список: currencies; справка по командам: help")
+        elif isinstance(exc, ApiRequestError):
+            print("Повторите попытку позже или проверьте сеть.")
     return True
 
 

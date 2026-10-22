@@ -1,7 +1,15 @@
 """Доменные модели приложения: ``User``, ``Wallet`` и ``Portfolio``.
 
-Все атрибуты классов приватные (с префиксом ``_``); доступ осуществляется
-через свойства с валидацией. Сериализация в JSON — через ``to_dict``/``from_dict``.
+Все поля приватные/защищённые: обычные атрибуты — с одним подчёркиванием
+(protected, соглашение Python), особо чувствительные данные пользователя
+(хеш пароля и соль) — с двумя (private, name mangling). Доступ — только
+через свойства с валидацией. Сериализация в JSON — ``to_dict``/``from_dict``.
+
+Точки интеграции раздела 3:
+
+- ``Wallet.currency`` — полиморфный объект валюты из реестра ``currencies``;
+- ``Wallet.withdraw`` бросает ``InsufficientFundsError``;
+- ``Portfolio.user`` ищет владельца через ``DatabaseManager``.
 """
 
 from __future__ import annotations
@@ -10,15 +18,15 @@ import math
 from datetime import datetime
 from typing import Any, Mapping
 
+from ..infra.database import DatabaseManager
+from .currencies import Currency, get_currency
+from .exceptions import InsufficientFundsError, ValidationError
 from .utils import (
     STUB_USD_RATES,
-    USERS_FILE,
-    ValidationError,
     format_amount,
     format_dt,
     generate_salt,
     hash_password,
-    load_json,
     now,
     parse_dt,
     to_iso,
@@ -45,7 +53,9 @@ class User:
     """Пользователь системы.
 
     Пароль хранится только в виде одностороннего псевдо-хеша
-    ``sha256(password + salt)``; соль сохраняется рядом.
+    ``sha256(password + salt)``; соль сохраняется рядом. Хеш и соль —
+    приватные атрибуты с name mangling (``__``): доступ извне класса
+    невозможен даже по соглашению.
     """
 
     def __init__(
@@ -60,10 +70,10 @@ class User:
         self.username = username  # валидация в сеттере
         if not isinstance(hashed_password, str) or not hashed_password:
             raise ValidationError("Хеш пароля не может быть пустым")
-        self._hashed_password = hashed_password
+        self.__hashed_password = hashed_password
         if not isinstance(salt, str) or not salt:
             raise ValidationError("Соль не может быть пустой")
-        self._salt = salt
+        self.__salt = salt
         self._registration_date = parse_dt(registration_date) or now()
 
     # ------------------------------------------------------------------
@@ -106,8 +116,8 @@ class User:
         return {
             "user_id": self._user_id,
             "username": self._username,
-            "hashed_password": self._hashed_password,
-            "salt": self._salt,
+            "hashed_password": self.__hashed_password,
+            "salt": self.__salt,
             "registration_date": to_iso(self._registration_date),
         }
 
@@ -132,12 +142,12 @@ class User:
     @property
     def hashed_password(self) -> str:
         """Хеш пароля (только чтение; меняется через change_password)."""
-        return self._hashed_password
+        return self.__hashed_password
 
     @property
     def salt(self) -> str:
         """Соль пользователя (только чтение)."""
-        return self._salt
+        return self.__salt
 
     @property
     def registration_date(self) -> datetime:
@@ -160,14 +170,14 @@ class User:
     def change_password(self, new_password: str) -> None:
         """Изменить пароль: новый пароль хешируется с новой солью."""
         new_password = validate_password(new_password)
-        self._salt = generate_salt()
-        self._hashed_password = hash_password(new_password, self._salt)
+        self.__salt = generate_salt()
+        self.__hashed_password = hash_password(new_password, self.__salt)
 
     def verify_password(self, password: str) -> bool:
         """Проверить введённый пароль на совпадение."""
         if not isinstance(password, str):
             return False
-        return verify_password(password, self._salt, self._hashed_password)
+        return verify_password(password, self.__salt, self.__hashed_password)
 
     def __repr__(self) -> str:
         return f"User(user_id={self._user_id}, username={self._username!r})"
@@ -188,6 +198,17 @@ class Wallet:
     def currency_code(self) -> str:
         """Код валюты (только чтение, задаётся при создании)."""
         return self._currency_code
+
+    @property
+    def currency(self) -> Currency:
+        """Объект валюты (FiatCurrency/CryptoCurrency) из реестра.
+
+        Точка интеграции с иерархией ``currencies``: позволяет полиморфно
+        получать описание валюты (``get_display_info``) для UI и логов.
+
+        :raises CurrencyNotFoundError: код кошелька отсутствует в реестре.
+        """
+        return get_currency(self._currency_code)
 
     @property
     def balance(self) -> float:
@@ -230,13 +251,16 @@ class Wallet:
         self._balance = round(self._balance + amount, 8)
 
     def withdraw(self, amount: float) -> None:
-        """Снять средства, если баланс позволяет."""
+        """Снять средства, если баланс позволяет.
+
+        :raises InsufficientFundsError: сумма снятия превышает баланс.
+        """
         amount = _positive_amount(amount, "Сумма списания")
         if amount > self._balance + 1e-9:
-            raise ValidationError(
-                "Недостаточно средств: доступно "
-                f"{format_amount(self._balance, self._currency_code)} {self._currency_code}, "
-                f"требуется {format_amount(amount, self._currency_code)} {self._currency_code}"
+            raise InsufficientFundsError(
+                available=format_amount(self._balance, self._currency_code),
+                required=format_amount(amount, self._currency_code),
+                code=self._currency_code,
             )
         self._balance = round(self._balance - amount, 8)
         if abs(self._balance) < 1e-12:
@@ -296,10 +320,16 @@ class Portfolio:
 
     @property
     def user(self) -> User | None:
-        """Объект пользователя-владельца (только чтение, без перезаписи)."""
-        for data in load_json(USERS_FILE, []):
-            if isinstance(data, dict) and data.get("user_id") == self._user_id:
-                return User.from_dict(data)
+        """Объект пользователя-владельца (только чтение, без перезаписи).
+
+        Поиск выполняется через синглтон ``DatabaseManager``.
+        """
+        raw = DatabaseManager().load("users", [])
+        if not isinstance(raw, list):
+            return None
+        for item in raw:
+            if isinstance(item, dict) and item.get("user_id") == self._user_id:
+                return User.from_dict(item)
         return None
 
     @property

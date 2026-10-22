@@ -1,30 +1,53 @@
 """Бизнес-логика приложения: сессия пользователя, портфель, сделки и курсы валют.
 
+Ключевые изменения раздела 3:
+
+- валидация валют через реестр ``currencies.get_currency()``;
+- пользовательские исключения из ``core/exceptions.py``
+  (``CurrencyNotFoundError``, ``ApiRequestError``, ``InsufficientFundsError``);
+- хранилище и конфигурация — через синглтоны ``DatabaseManager``
+  и ``SettingsLoader`` (безопасное «чтение → модификация → запись»);
+- операции ``register``/``login``/``buy``/``sell`` логируются декоратором
+  ``@log_action`` (``logs/actions.log``).
+
 CLI (``valutatrade_hub/cli/interface.py``) не дублирует бизнес-логику —
-он лишь разбирает аргументы и вызывает методы ``AppService`` из этого модуля.
+он лишь разбирает аргументы и вызывает методы ``AppService``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from ..decorators import log_action
+from ..infra.database import DatabaseManager
+from ..infra.settings import SettingsLoader
+from ..logging_config import setup_logging
+from . import currencies
+from .currencies import get_currency
+from .exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+    NotLoggedInError,
+    UnknownBaseCurrencyError,
+    UserNotFoundError,
+    UsernameTakenError,
+    ValidationError,
+    WalletNotFoundError,
+    WrongPasswordError,
+)
 from .models import Portfolio, User
 from .utils import (
-    PORTFOLIOS_FILE,
-    RATES_FILE,
     STUB_USD_RATES,
-    USERS_FILE,
-    ensure_data_files,
+    cross_rate,
     format_amount,
     format_dt,
     format_rate,
-    load_json,
     now,
     parse_dt,
-    save_json,
     to_iso,
     validate_amount,
     validate_currency_code,
@@ -33,83 +56,8 @@ from .utils import (
 )
 
 # ---------------------------------------------------------------------------
-# Ошибки приложения (сообщения показываются пользователю как есть)
+# Хранилище (users.json / portfolios.json) — через синглтон DatabaseManager
 # ---------------------------------------------------------------------------
-
-
-class AppError(Exception):
-    """Базовый класс ошибок приложения с сообщением для пользователя."""
-
-
-class UsernameTakenError(AppError):
-    """Имя пользователя уже занято."""
-
-
-class UserNotFoundError(AppError):
-    """Пользователь с таким именем не найден."""
-
-
-class WrongPasswordError(AppError):
-    """Введён неверный пароль."""
-
-
-class NotLoggedInError(AppError):
-    """Команда доступна только залогиненному пользователю."""
-
-
-class WalletNotFoundError(AppError):
-    """У пользователя нет кошелька с такой валютой."""
-
-
-class InsufficientFundsError(AppError):
-    """На кошельке недостаточно средств."""
-
-
-class RateNotAvailableError(AppError):
-    """Курс валюты недоступен."""
-
-
-class UnknownBaseCurrencyError(AppError):
-    """Неизвестная базовая валюта конвертации."""
-
-
-# ---------------------------------------------------------------------------
-# Хранилище: users.json / portfolios.json
-# ---------------------------------------------------------------------------
-
-
-def load_users() -> list[User]:
-    """Загрузить всех пользователей из users.json."""
-    data = load_json(USERS_FILE, [])
-    return [User.from_dict(item) for item in data if isinstance(item, dict)]
-
-
-def save_users(users: list[User]) -> None:
-    """Сохранить всех пользователей в users.json."""
-    save_json(USERS_FILE, [user.to_dict() for user in users])
-
-
-def load_portfolios() -> list[Portfolio]:
-    """Загрузить все портфели из portfolios.json."""
-    data = load_json(PORTFOLIOS_FILE, [])
-    return [Portfolio.from_dict(item) for item in data if isinstance(item, dict)]
-
-
-def save_portfolios(portfolios: list[Portfolio]) -> None:
-    """Сохранить все портфели в portfolios.json."""
-    save_json(PORTFOLIOS_FILE, [portfolio.to_dict() for portfolio in portfolios])
-
-
-def upsert_portfolio(portfolio: Portfolio) -> None:
-    """Сохранить портфель в portfolios.json (обновить существующий или дописать)."""
-    portfolios = load_portfolios()
-    for index, existing in enumerate(portfolios):
-        if existing.user_id == portfolio.user_id:
-            portfolios[index] = portfolio
-            break
-    else:
-        portfolios.append(portfolio)
-    save_portfolios(portfolios)
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +92,6 @@ class StubParserClient:
 # Сервис курсов: кеш data/rates.json + обращение к Parser Service
 # ---------------------------------------------------------------------------
 
-#: Курсы в кеше считаются свежими, пока моложе этого времени.
-CACHE_TTL = timedelta(minutes=5)
-
 _PAIR_SUFFIX = "_USD"
 
 
@@ -179,12 +124,18 @@ class _CacheSnapshot:
 class RateService:
     """Получение курсов: сначала кеш ``data/rates.json``, затем Parser Service.
 
-    Курсы хранятся как «1 единица валюты → USD»; курс произвольной пары
-    A→B считается кросс-курсом через USD: ``rates[A] / rates[B]``.
+    TTL свежести кеша и пути к файлам берутся из ``SettingsLoader`` и
+    ``DatabaseManager``. Курсы хранятся как «1 единица валюты → USD»;
+    курс произвольной пары A→B считается кросс-курсом через USD.
+
+    Ошибки: ``ApiRequestError`` — сбой Parser Service, ``CurrencyNotFoundError`` —
+    код валюты отсутствует в полученных курсах.
     """
 
-    def __init__(self, client: ParserClient | None = None, ttl: timedelta = CACHE_TTL) -> None:
+    def __init__(self, client: ParserClient | None = None, ttl: timedelta | None = None) -> None:
         self._client: ParserClient = client if client is not None else StubParserClient()
+        if ttl is None:
+            ttl = timedelta(seconds=SettingsLoader().rates_ttl_seconds)
         self._ttl = ttl
 
     # -- публичный API -----------------------------------------------------
@@ -197,12 +148,8 @@ class RateService:
         """Получить курс пары валют, при необходимости обновив кеш."""
         from_c = validate_currency_code(from_currency)
         to_c = validate_currency_code(to_currency)
-        snapshot = self._snapshot()
-        if from_c not in snapshot.rates or to_c not in snapshot.rates or snapshot.rates[to_c] <= 0:
-            raise RateNotAvailableError(
-                f"Курс {from_c}→{to_c} недоступен. Повторите попытку позже."
-            )
-        rate = snapshot.rates[from_c] / snapshot.rates[to_c]
+        snapshot = self._snapshot()  # ApiRequestError при полном сбое
+        rate = cross_rate(snapshot.rates, from_c, to_c)  # CurrencyNotFoundError
         stamps = [snapshot.timestamps.get(code) for code in (from_c, to_c)]
         stamps = [stamp for stamp in stamps if stamp is not None]
         updated_at = min(stamps) if stamps else now()
@@ -213,12 +160,7 @@ class RateService:
         cached = self._load_cache()
         if not force and cached is not None and self._is_fresh(cached):
             return f"Курсы актуальны, обновление не требуется (источник: {cached.source})"
-        try:
-            rates = self._fetch_from_client()
-        except Exception:
-            raise RateNotAvailableError(
-                "Сервис курсов недоступен. Повторите попытку позже."
-            ) from None
+        rates = self._fetch_from_client()  # ApiRequestError при сбое
         self._save_cache(rates, self._client.source)
         return f"Курсы обновлены: {len(rates)} валют (источник: {self._client.source})"
 
@@ -231,12 +173,10 @@ class RateService:
             return cached
         try:
             rates = self._fetch_from_client()
-        except Exception:
+        except ApiRequestError:
             if cached is not None:
                 return cached  # устаревший кеш лучше, чем ничего
-            raise RateNotAvailableError(
-                "Сервис курсов недоступен. Повторите попытку позже."
-            ) from None
+            raise
         self._save_cache(rates, self._client.source)
         refreshed = self._load_cache()
         if refreshed is not None:
@@ -245,21 +185,29 @@ class RateService:
 
     def _fetch_from_client(self) -> dict[str, float]:
         """Запросить курсы у Parser Service и проверить ответ."""
-        raw = self._client.fetch_rates()
+        try:
+            raw = self._client.fetch_rates()
+        except ApiRequestError:
+            raise
+        except Exception as exc:
+            raise ApiRequestError(f"сервис парсинга недоступен ({exc})") from exc
         if not isinstance(raw, Mapping) or not raw:
-            raise ValueError("Parser Service вернул пустой ответ")
+            raise ApiRequestError("пустой ответ от Parser Service")
         rates: dict[str, float] = {"USD": 1.0}
         for code, value in raw.items():
-            currency = validate_currency_code(code)
-            rate = float(value)
+            try:
+                currency = validate_currency_code(code)
+                rate = float(value)
+            except (ValidationError, TypeError, ValueError) as exc:
+                raise ApiRequestError(f"некорректные данные курса для '{code}'") from exc
             if rate <= 0:
-                raise ValueError(f"Некорректный курс для {currency}")
+                raise ApiRequestError(f"некорректный курс для {currency}")
             rates[currency] = rate
         return rates
 
     def _load_cache(self) -> _CacheSnapshot | None:
-        """Прочитать кеш курсов из data/rates.json."""
-        data = load_json(RATES_FILE, {})
+        """Прочитать кеш курсов из data/rates.json (через DatabaseManager)."""
+        data = DatabaseManager().load("rates", {})
         if not isinstance(data, dict) or not data:
             return None
         rates: dict[str, float] = {}
@@ -303,7 +251,7 @@ class RateService:
         }
         payload["source"] = source
         payload["last_refresh"] = stamp
-        save_json(RATES_FILE, payload)
+        DatabaseManager().save("rates", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -312,13 +260,22 @@ class RateService:
 
 
 class AppService:
-    """Бизнес-логика приложения поверх хранилищ JSON и сервиса курсов."""
+    """Бизнес-логика приложения поверх синглтонов и сервиса курсов.
+
+    Синглтоны: ``SettingsLoader`` (конфигурация: TTL курсов, пути к данным
+    и логам) и ``DatabaseManager`` (единственная точка доступа к JSON-хранилищу).
+    """
 
     def __init__(self, rate_service: RateService | None = None) -> None:
-        ensure_data_files()
+        setup_logging()
+        self._settings = SettingsLoader()
+        self._db = DatabaseManager()
         self._rates = rate_service if rate_service is not None else RateService()
         self._current_user: User | None = None
         self._current_portfolio: Portfolio | None = None
+        #: Контекст последней операции для декоратора @log_action
+        #: (rate, before/after — состояние кошелька).
+        self._last_action_context: dict[str, Any] = {}
 
     @property
     def current_user(self) -> User | None:
@@ -335,39 +292,84 @@ class AppService:
             raise NotLoggedInError("Сначала выполните login")
         return self._current_user, self._current_portfolio
 
-    # -- пользователи и сессия -----------------------------------------------
+    # ------------------------------------------------------------------
+    # Хранилище: типизированные обёртки над DatabaseManager
+    # ------------------------------------------------------------------
 
+    def _load_users(self) -> list[User]:
+        raw = self._db.load("users", [])
+        return [User.from_dict(item) for item in raw if isinstance(item, dict)]
+
+    def _update_users(self, mutate: Callable[[list[User]], list[User]]) -> None:
+        """Безопасное обновление users.json: чтение → модификация → запись."""
+
+        def raw_mutate(raw: Any) -> Any:
+            users = [User.from_dict(item) for item in raw if isinstance(item, dict)]
+            return [user.to_dict() for user in mutate(users)]
+
+        self._db.update("users", raw_mutate)
+
+    def _load_portfolios(self) -> list[Portfolio]:
+        raw = self._db.load("portfolios", [])
+        return [Portfolio.from_dict(item) for item in raw if isinstance(item, dict)]
+
+    def _update_portfolios(self, mutate: Callable[[list[Portfolio]], list[Portfolio]]) -> None:
+        """Безопасное обновление portfolios.json: чтение → модификация → запись."""
+
+        def raw_mutate(raw: Any) -> Any:
+            portfolios = [Portfolio.from_dict(item) for item in raw if isinstance(item, dict)]
+            return [portfolio.to_dict() for portfolio in mutate(portfolios)]
+
+        self._db.update("portfolios", raw_mutate)
+
+    def _save_portfolio(self, portfolio: Portfolio) -> None:
+        """Сохранить портфель пользователя (обновить существующий или дописать)."""
+
+        def mutate(portfolios: list[Portfolio]) -> list[Portfolio]:
+            exists = any(item.user_id == portfolio.user_id for item in portfolios)
+            updated = [portfolio if item.user_id == portfolio.user_id else item for item in portfolios]
+            if not exists:
+                updated.append(portfolio)
+            return updated
+
+        self._update_portfolios(mutate)
+
+    # ------------------------------------------------------------------
+    # Пользователи и сессия
+    # ------------------------------------------------------------------
+
+    @log_action("REGISTER")
     def register(self, username: str, password: str) -> str:
         """Зарегистрировать пользователя и создать ему пустой портфель."""
         username = validate_username(username)
-        users = load_users()
+        users = self._load_users()
         if any(user.username == username for user in users):
             raise UsernameTakenError(f"Имя пользователя '{username}' уже занято")
         password = validate_password(password)
         user_id = max((user.user_id for user in users), default=0) + 1
         user = User.create(user_id, username, password)
-        save_users([*users, user])
-        save_portfolios([*load_portfolios(), Portfolio(user_id)])
+        self._update_users(lambda items: [*items, user])
+        self._update_portfolios(lambda items: [*items, Portfolio(user_id)])
         return (
             f"Пользователь '{username}' зарегистрирован (id={user_id}). "
             f"Войдите: login --username {username} --password ****"
         )
 
+    @log_action("LOGIN")
     def login(self, username: str, password: str) -> str:
         """Войти в систему и зафиксировать текущую сессию."""
         username = validate_username(username)
-        user = next((item for item in load_users() if item.username == username), None)
+        user = next((item for item in self._load_users() if item.username == username), None)
         if user is None:
             raise UserNotFoundError(f"Пользователь '{username}' не найден")
         if not user.verify_password(password):
             raise WrongPasswordError("Неверный пароль")
         self._current_user = user
-        portfolios = load_portfolios()
+        portfolios = self._load_portfolios()
         portfolio = next((item for item in portfolios if item.user_id == user.user_id), None)
         if portfolio is None:
             portfolio = Portfolio(user.user_id)
-            portfolios.append(portfolio)
-            save_portfolios(portfolios)
+            self._update_portfolios(lambda items: [*items, portfolio])
         self._current_portfolio = portfolio
         return f"Вы вошли как '{username}'"
 
@@ -388,11 +390,14 @@ class AppService:
         """Изменить пароль текущего пользователя и сохранить его."""
         user, _ = self._require_login()
         user.change_password(new_password)
-        users = load_users()
-        save_users([user if item.user_id == user.user_id else item for item in users])
+        self._update_users(
+            lambda items: [user if item.user_id == user.user_id else item for item in items]
+        )
         return "Пароль изменён"
 
-    # -- портфель -------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Портфель
+    # ------------------------------------------------------------------
 
     def show_portfolio(self, base_currency: str = "USD") -> str:
         """Показать все кошельки и итоговую стоимость в базовой валюте."""
@@ -436,9 +441,9 @@ class AppService:
     def add_currency(self, currency: str) -> str:
         """Добавить новый пустой кошелёк в портфель пользователя."""
         user, portfolio = self._require_login()
-        code = validate_currency_code(currency)
+        code = get_currency(currency).code
         wallet = portfolio.add_currency(code)
-        upsert_portfolio(portfolio)
+        self._save_portfolio(portfolio)
         return (
             f"Кошелёк '{code}' создан для пользователя '{user.username}'. "
             f"Баланс: {format_amount(wallet.balance, code)} {code}"
@@ -447,34 +452,44 @@ class AppService:
     def deposit(self, currency: str, amount: float) -> str:
         """Пополнить кошелёк указанной валюты (демо-режим симулятора)."""
         user, portfolio = self._require_login()
-        code = validate_currency_code(currency)
+        code = get_currency(currency).code
         amount = validate_amount(amount)
         existed = portfolio.get_wallet(code) is not None
         wallet = portfolio.get_or_create_wallet(code)
         wallet.deposit(amount)
-        upsert_portfolio(portfolio)
+        self._save_portfolio(portfolio)
         prefix = "" if existed else f"Создан кошелёк '{code}'. "
         return (
             f"{prefix}Кошелёк '{code}' пополнен на {format_amount(amount, code)}. "
             f"Баланс: {format_amount(wallet.balance, code)} {code}"
         )
 
-    # -- сделки ----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Сделки
+    # ------------------------------------------------------------------
 
+    @log_action("BUY", verbose=True)
     def buy(self, currency: str, amount: float) -> str:
-        """Купить валюту: пополнить её кошелёк и списать стоимость с USD-кошелька."""
+        """Купить валюту: пополнить её кошелёк и списать стоимость с USD-кошелька.
+
+        :raises CurrencyNotFoundError: валюта отсутствует в реестре;
+        :raises ApiRequestError: не удалось получить курс.
+        """
         user, portfolio = self._require_login()
-        code = validate_currency_code(currency)
+        self._last_action_context = {}
+        code = get_currency(currency).code
         amount = validate_amount(amount)
-        try:
-            rate_info = self._rates.get_pair_rate(code, "USD")
-        except RateNotAvailableError:
-            raise RateNotAvailableError(f"Не удалось получить курс для {code}→USD") from None
+        rate_info = self._get_trade_rate(code)
         existed = portfolio.get_wallet(code) is not None
         wallet = portfolio.get_or_create_wallet(code)
         before = wallet.balance
         wallet.deposit(amount)
         cost = round(amount * rate_info.rate, 8)
+        self._last_action_context = {
+            "rate": format_rate(rate_info.rate),
+            "before": format_amount(before, code),
+            "after": format_amount(wallet.balance, code),
+        }
 
         lines = [
             f"Покупка выполнена: {format_amount(amount, code)} {code} "
@@ -513,13 +528,20 @@ class AppService:
             usd_wallet = portfolio.get_wallet("USD")
             note = "" if usd_wallet is None else " (на USD-кошельке недостаточно средств)"
             lines.append(f"Оценочная стоимость покупки: {format_amount(cost)} USD{note}")
-        upsert_portfolio(portfolio)
+        self._save_portfolio(portfolio)
         return "\n".join(lines)
 
+    @log_action("SELL", verbose=True)
     def sell(self, currency: str, amount: float) -> str:
-        """Продать валюту: списать её с кошелька и зачислить выручку в USD."""
+        """Продать валюту: списать её с кошелька и зачислить выручку в USD.
+
+        :raises WalletNotFoundError: кошелька с такой валютой нет;
+        :raises InsufficientFundsError: на кошельке недостаточно средств;
+        :raises ApiRequestError: не удалось получить курс.
+        """
         user, portfolio = self._require_login()
-        code = validate_currency_code(currency)
+        self._last_action_context = {}
+        code = get_currency(currency).code
         amount = validate_amount(amount)
         wallet = portfolio.get_wallet(code)
         if wallet is None:
@@ -529,17 +551,19 @@ class AppService:
             )
         if amount > wallet.balance + 1e-9:
             raise InsufficientFundsError(
-                f"Недостаточно средств: доступно {format_amount(wallet.balance, code)} {code}, "
-                f"требуется {format_amount(amount, code)} {code}"
+                available=format_amount(wallet.balance, code),
+                required=format_amount(amount, code),
+                code=code,
             )
-        try:
-            rate_info = self._rates.get_pair_rate(code, "USD")
-        except RateNotAvailableError:
-            raise RateNotAvailableError(f"Не удалось получить курс для {code}→USD") from None
-
+        rate_info = self._get_trade_rate(code)
         before = wallet.balance
-        wallet.withdraw(amount)
+        wallet.withdraw(amount)  # InsufficientFundsError как страховка
         revenue = round(amount * rate_info.rate, 8)
+        self._last_action_context = {
+            "rate": format_rate(rate_info.rate),
+            "before": format_amount(before, code),
+            "after": format_amount(wallet.balance, code),
+        }
 
         # При продаже эквивалент начисляется на USD-кошелёк
         # (при необходимости кошелёк USD создаётся автоматически).
@@ -571,15 +595,28 @@ class AppService:
             if not usd_existed:
                 lines.append("Создан USD-кошелёк (базовая валюта)")
         lines.append(f"Выручка зачислена на USD-кошелёк: {format_amount(revenue)} USD")
-        upsert_portfolio(portfolio)
+        self._save_portfolio(portfolio)
         return "\n".join(lines)
 
-    # -- курсы -------------------------------------------------------------------
+    def _get_trade_rate(self, code: str) -> Any:
+        """Курс currency→USD для сделки; сбой отдаётся как ApiRequestError."""
+        try:
+            return self._rates.get_pair_rate(code, "USD")
+        except (ApiRequestError, CurrencyNotFoundError):
+            raise ApiRequestError(f"не удалось получить курс для {code}→USD") from None
+
+    # ------------------------------------------------------------------
+    # Курсы
+    # ------------------------------------------------------------------
 
     def get_rate(self, from_currency: str, to_currency: str) -> str:
-        """Получить текущий курс одной валюты к другой."""
-        from_c = validate_currency_code(from_currency)
-        to_c = validate_currency_code(to_currency)
+        """Получить текущий курс одной валюты к другой.
+
+        :raises CurrencyNotFoundError: один из кодов отсутствует в реестре;
+        :raises ApiRequestError: сбой при получении курсов.
+        """
+        from_c = get_currency(from_currency).code
+        to_c = get_currency(to_currency).code
         rate_info = self._rates.get_pair_rate(from_c, to_c)
         return (
             f"Курс {from_c}→{to_c}: {format_rate(rate_info.rate)} "
@@ -590,3 +627,11 @@ class AppService:
     def refresh_rates(self) -> str:
         """Принудительно обновить кеш курсов через Parser Service."""
         return self._rates.refresh(force=True)
+
+    def list_currencies(self) -> str:
+        """Список поддерживаемых валют (для команды currencies)."""
+        lines = ["Поддерживаемые валюты:"]
+        for currency in currencies.list_currencies():
+            lines.append(f"  {currency.get_display_info()}")
+        lines.append("Сделки и курсы доступны только для валют из этого списка.")
+        return "\n".join(lines)
